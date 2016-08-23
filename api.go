@@ -43,6 +43,10 @@ var (
 	// ErrCantBootstrap is returned when attempt is made to bootstrap a
 	// cluster that already has state present.
 	ErrCantBootstrap = errors.New("bootstrap only works on new clusters")
+
+	// ErrBadStateForElection is returned when an attempt is made to stand for election when
+	// the node is either not a follower or there are no peers that can elect it as the leader
+	ErrBadStateForElection = errors.New("Node is not in the appropriate state to stand for election")
 )
 
 // Raft implements a Raft node.
@@ -131,6 +135,10 @@ type Raft struct {
 	// verifyCh is used to async send verify futures to the main thread
 	// to verify we are still the leader
 	verifyCh chan *verifyFuture
+
+	// campaignCh is used to switch a follower into a candidate and run
+	// for election
+	campaignCh chan *campaignFuture
 
 	// configurationsCh is used to get the configuration data safely from
 	// outside of the main thread.
@@ -446,6 +454,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		stable:                stable,
 		trans:                 trans,
 		verifyCh:              make(chan *verifyFuture, 64),
+		campaignCh:            make(chan *campaignFuture, 8),
 		configurationsCh:      make(chan *configurationsFuture, 8),
 		bootstrapCh:           make(chan *bootstrapFuture),
 		observers:             make(map[uint64]*Observer),
@@ -639,6 +648,52 @@ func (r *Raft) Barrier(timeout time.Duration) Future {
 		return errorFuture{ErrRaftShutdown}
 	case r.applyCh <- logFuture:
 		return logFuture
+	}
+}
+
+// ForgetLeader will ask the node to forget who the leader is so that other nodes
+// can stand for election
+func (r *Raft) ForgetLeader(timeout time.Duration) Future {
+	campaignFuture := &campaignFuture{}
+	campaignFuture.init()
+	campaignFuture.runForElection = false
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	case r.campaignCh <- campaignFuture:
+		return campaignFuture
+	}
+}
+
+// ForceElection will ask the node to become a candidate and stand for election
+func (r *Raft) ForceElection(timeout time.Duration) Future {
+	campaignFuture := &campaignFuture{}
+	campaignFuture.init()
+	campaignFuture.runForElection = true
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		// I decided not to warn if the timeout is too small here
+		// the side effect is that users may get a timeout before the process
+		// finishes - only to find it ultimately finished
+		timer = time.After(timeout)
+	}
+
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	case r.campaignCh <- campaignFuture:
+		return campaignFuture
 	}
 }
 

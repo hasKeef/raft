@@ -183,6 +183,15 @@ type verifyFuture struct {
 	voteLock   sync.Mutex
 }
 
+// campaignFuture is used to force the node to forget it's leader
+// and optionally run for election. This is useful in a case where the
+// caller knows for fact that the leader has gone offline and wants to
+// force a re-election in < ElectionTimeout
+type campaignFuture struct {
+	deferError
+	runForElection bool
+}
+
 // configurationsFuture is used to retrieve the current configurations. This is
 // used to allow safe access to this information outside of the main thread.
 type configurationsFuture struct {

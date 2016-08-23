@@ -5,7 +5,9 @@ import (
 	"container/list"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/armon/go-metrics"
 )
@@ -143,6 +145,9 @@ func (r *Raft) runFollower() {
 	r.logger.Printf("[INFO] raft: %v entering Follower state (Leader: %q)", r, r.Leader())
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
 	heartbeatTimer := randomTimeout(r.conf.HeartbeatTimeout)
+
+	var campaign unsafe.Pointer
+
 	for {
 		select {
 		case rpc := <-r.rpcCh:
@@ -167,13 +172,29 @@ func (r *Raft) runFollower() {
 		case b := <-r.bootstrapCh:
 			b.respond(r.liveBootstrap(b.configuration))
 
+		case e := <-r.campaignCh:
+			r.setLeader("")
+
+			if e.runForElection {
+				// Wait for the timeout
+				if !atomic.CompareAndSwapPointer(&campaign, unsafe.Pointer(nil), unsafe.Pointer(e)) {
+					e.respond(ErrBadStateForElection)
+					continue
+				}
+
+				// stagger the standing for election
+				heartbeatTimer = randomTimeout(time.Millisecond * 500)
+			} else {
+				e.respond(nil)
+			}
+
 		case <-heartbeatTimer:
 			// Restart the heartbeat timer
 			heartbeatTimer = randomTimeout(r.conf.HeartbeatTimeout)
 
 			// Check if we have had a successful contact
 			lastContact := r.LastContact()
-			if time.Now().Sub(lastContact) < r.conf.HeartbeatTimeout {
+			if campaign == nil && time.Now().Sub(lastContact) < r.conf.HeartbeatTimeout {
 				continue
 			}
 
@@ -194,9 +215,19 @@ func (r *Raft) runFollower() {
 				}
 			} else {
 				r.logger.Printf(`[WARN] raft: Heartbeat timeout from %q reached, starting election`, lastLeader)
+
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				r.setState(Candidate)
+				if campaign != nil {
+					(*campaignFuture)(campaign).respond(nil)
+					campaign = nil
+				}
 				return
+			}
+
+			if campaign != nil {
+				(*campaignFuture)(campaign).respond(ErrBadStateForElection)
+				campaign = nil
 			}
 
 		case <-r.shutdownCh:
@@ -270,6 +301,10 @@ func (r *Raft) runCandidate() {
 				r.setLeader(r.localAddr)
 				return
 			}
+
+		case e := <-r.campaignCh:
+			// The node is already a candidate
+			e.respond(nil)
 
 		case c := <-r.configurationChangeCh:
 			// Reject any operations since we are not the leader
@@ -559,6 +594,9 @@ func (r *Raft) leaderLoop() {
 
 		case b := <-r.bootstrapCh:
 			b.respond(ErrCantBootstrap)
+
+		case e := <-r.campaignCh:
+			e.respond(ErrBadStateForElection)
 
 		case newLog := <-r.applyCh:
 			// Group commit, gather all the ready commits
