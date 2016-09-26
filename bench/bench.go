@@ -6,8 +6,9 @@ package raftbench
 // makes comparing backend performance easier by sharing the tests.
 
 import (
-	"github.com/hasKeef/raft"
 	"testing"
+
+	"github.com/hasKeef/raft"
 )
 
 func FirstIndex(b *testing.B, store raft.LogStore) {

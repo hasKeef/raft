@@ -552,9 +552,6 @@ func (r *Raft) leaderLoop() {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
-		case <-r.leaderState.stepDown:
-			r.setState(Follower)
-
 		case future := <-r.verifyCh:
 			// Try to batch all queued verifies together.
 			futures := []*verifyFuture{future}
