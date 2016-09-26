@@ -600,6 +600,13 @@ func (r *Raft) Leader() ServerAddress {
 	return leader
 }
 
+// CurrentTerm is used to return the current term that the current
+// leader was elected in. This doesn't mean much for a new node
+// that has yet to discover a leader
+func (r *Raft) CurrentTerm() uint64 {
+	return r.getCurrentTerm()
+}
+
 // Apply is used to apply a command to the FSM in a highly consistent
 // manner. This returns a future that can be used to wait on the application.
 // An optional timeout can be provided to limit the amount of time we wait
