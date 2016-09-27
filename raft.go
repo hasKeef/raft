@@ -195,8 +195,8 @@ func (r *Raft) runFollower() {
 					continue
 				}
 
-				// stagger the standing for election
-				heartbeatTimer = randomTimeout(time.Millisecond * 500)
+				// a bit shorter of a timeout this time round
+				heartbeatTimer = randomTimeout(time.Millisecond)
 			} else {
 				e.respond(nil)
 			}
