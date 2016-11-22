@@ -20,8 +20,8 @@ type SnapshotMeta struct {
 	ID string
 
 	// Index and Term store when the snapshot was taken.
-	Index uint64
-	Term  uint64
+	Index Index
+	Term  Term
 
 	// Peers is deprecated and used to support version 0 snapshots, but will
 	// be populated in version 1 snapshots as well to help with upgrades.
@@ -29,8 +29,10 @@ type SnapshotMeta struct {
 
 	// Configuration and ConfigurationIndex are present in version 1
 	// snapshots and later.
-	Configuration      Configuration
-	ConfigurationIndex uint64
+	// These fields have a different json field name for compatibility
+	// with the library-v2-stage-one branch.
+	Membership      Membership `json:"Configuration"`
+	MembershipIndex Index      `json:"ConfigurationIndex"`
 
 	// Size is the size of the snapshot in bytes.
 	Size int64
@@ -42,10 +44,10 @@ type SnapshotMeta struct {
 // without streaming from the leader.
 type SnapshotStore interface {
 	// Create is used to begin a snapshot at a given index and term, and with
-	// the given committed configuration. The version parameter controls
+	// the given committed membership configuration. The version parameter controls
 	// which snapshot version to create.
-	Create(version SnapshotVersion, index, term uint64, configuration Configuration,
-		configurationIndex uint64, trans Transport) (SnapshotSink, error)
+	Create(version SnapshotVersion, index Index, term Term, membership Membership,
+		membershipIndex Index, trans Transport) (SnapshotSink, error)
 
 	// List is used to list the available snapshots in the store.
 	// It should return then in descending order, with the highest index first.
@@ -79,7 +81,7 @@ func getLastSnapshot(snapshots SnapshotStore) (*SnapshotMeta, error) {
 // runSnapshots is a long running goroutine used to manage taking
 // new snapshots of the FSM. It runs in parallel to the FSM and
 // main goroutines, so that snapshots do not block normal operation.
-func (r *Raft) runSnapshots() {
+func (r *raftServer) runSnapshots() {
 	for {
 		select {
 		case <-randomTimeout(r.conf.SnapshotInterval):
@@ -89,23 +91,19 @@ func (r *Raft) runSnapshots() {
 			}
 
 			// Trigger a snapshot
-			if _, err := r.takeSnapshot(); err != nil {
-				r.logger.Printf("[ERR] raft: Failed to take snapshot: %v", err)
+			if err := r.takeSnapshot(); err != nil {
+				r.logger.Error("Failed to take snapshot", "error", err)
 			}
 
-		case future := <-r.userSnapshotCh:
+		case future := <-r.api.snapshotCh:
 			// User-triggered, run immediately
-			id, err := r.takeSnapshot()
+			err := r.takeSnapshot()
 			if err != nil {
-				r.logger.Printf("[ERR] raft: Failed to take snapshot: %v", err)
-			} else {
-				future.opener = func() (*SnapshotMeta, io.ReadCloser, error) {
-					return r.snapshots.Open(id)
-				}
+				r.logger.Error("Failed to take snapshot", "error", err)
 			}
 			future.respond(err)
 
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 			return
 		}
 	}
@@ -113,26 +111,25 @@ func (r *Raft) runSnapshots() {
 
 // shouldSnapshot checks if we meet the conditions to take
 // a new snapshot.
-func (r *Raft) shouldSnapshot() bool {
+func (r *raftServer) shouldSnapshot() bool {
 	// Check the last snapshot index
-	lastSnap, _ := r.getLastSnapshot()
+	lastSnap, _ := r.shared.getLastSnapshot()
 
 	// Check the last log index
 	lastIdx, err := r.logs.LastIndex()
 	if err != nil {
-		r.logger.Printf("[ERR] raft: Failed to get last log index: %v", err)
+		r.logger.Error("Failed to get last log index", "error", err)
 		return false
 	}
 
 	// Compare the delta to the threshold
-	delta := lastIdx - lastSnap
+	delta := uint64(lastIdx - lastSnap)
 	return delta >= r.conf.SnapshotThreshold
 }
 
 // takeSnapshot is used to take a new snapshot. This must only be called from
-// the snapshot thread, never the main thread. This returns the ID of the new
-// snapshot, along with an error.
-func (r *Raft) takeSnapshot() (string, error) {
+// the snapshot thread, never the main thread.
+func (r *raftServer) takeSnapshot() error {
 	defer metrics.MeasureSince([]string{"raft", "snapshot", "takeSnapshot"}, time.Now())
 
 	// Create a request for the FSM to perform a snapshot.
@@ -142,8 +139,8 @@ func (r *Raft) takeSnapshot() (string, error) {
 	// Wait for dispatch or shutdown.
 	select {
 	case r.fsmSnapshotCh <- snapReq:
-	case <-r.shutdownCh:
-		return "", ErrRaftShutdown
+	case <-r.api.shutdownCh:
+		return ErrRaftShutdown
 	}
 
 	// Wait until we get a response
@@ -151,25 +148,25 @@ func (r *Raft) takeSnapshot() (string, error) {
 		if err != ErrNothingNewToSnapshot {
 			err = fmt.Errorf("failed to start snapshot: %v", err)
 		}
-		return "", err
+		return err
 	}
 	defer snapReq.snapshot.Release()
 
-	// Make a request for the configurations and extract the committed info.
+	// Make a request for the memberships and extract the committed info.
 	// We have to use the future here to safely get this information since
 	// it is owned by the main thread.
-	configReq := &configurationsFuture{}
+	configReq := &membershipsFuture{}
 	configReq.init()
 	select {
-	case r.configurationsCh <- configReq:
-	case <-r.shutdownCh:
-		return "", ErrRaftShutdown
+	case r.api.membershipsCh <- configReq:
+	case <-r.api.shutdownCh:
+		return ErrRaftShutdown
 	}
 	if err := configReq.Error(); err != nil {
-		return "", err
+		return err
 	}
-	committed := configReq.configurations.committed
-	committedIndex := configReq.configurations.committedIndex
+	committed := configReq.memberships.committed
+	committedIndex := configReq.memberships.committedIndex
 
 	// We don't support snapshots while there's a config change outstanding
 	// since the snapshot doesn't have a means to represent this state. This
@@ -180,17 +177,17 @@ func (r *Raft) takeSnapshot() (string, error) {
 	// then it's not crucial that we snapshot, since there's not much going
 	// on Raft-wise.
 	if snapReq.index < committedIndex {
-		return "", fmt.Errorf("cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
+		return fmt.Errorf("cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
 			committedIndex, snapReq.index)
 	}
 
 	// Create a new snapshot.
-	r.logger.Printf("[INFO] raft: Starting snapshot up to %d", snapReq.index)
+	r.logger.Info("Starting snapshot", "index", snapReq.index)
 	start := time.Now()
 	version := getSnapshotVersion(r.protocolVersion)
 	sink, err := r.snapshots.Create(version, snapReq.index, snapReq.term, committed, committedIndex, r.trans)
 	if err != nil {
-		return "", fmt.Errorf("failed to create snapshot: %v", err)
+		return fmt.Errorf("failed to create snapshot: %v", err)
 	}
 	metrics.MeasureSince([]string{"raft", "snapshot", "create"}, start)
 
@@ -198,30 +195,30 @@ func (r *Raft) takeSnapshot() (string, error) {
 	start = time.Now()
 	if err := snapReq.snapshot.Persist(sink); err != nil {
 		sink.Cancel()
-		return "", fmt.Errorf("failed to persist snapshot: %v", err)
+		return fmt.Errorf("failed to persist snapshot: %v", err)
 	}
 	metrics.MeasureSince([]string{"raft", "snapshot", "persist"}, start)
 
 	// Close and check for error.
 	if err := sink.Close(); err != nil {
-		return "", fmt.Errorf("failed to close snapshot: %v", err)
+		return fmt.Errorf("failed to close snapshot: %v", err)
 	}
 
 	// Update the last stable snapshot info.
-	r.setLastSnapshot(snapReq.index, snapReq.term)
+	r.shared.setLastSnapshot(snapReq.index, snapReq.term)
 
 	// Compact the logs.
 	if err := r.compactLogs(snapReq.index); err != nil {
-		return "", err
+		return err
 	}
 
-	r.logger.Printf("[INFO] raft: Snapshot to %d complete", snapReq.index)
-	return sink.ID(), nil
+	r.logger.Info("Snapshot complete", "index", snapReq.index)
+	return nil
 }
 
 // compactLogs takes the last inclusive index of a snapshot
 // and trims the logs that are no longer needed.
-func (r *Raft) compactLogs(snapIdx uint64) error {
+func (r *raftServer) compactLogs(snapIdx Index) error {
 	defer metrics.MeasureSince([]string{"raft", "compactLogs"}, time.Now())
 	// Determine log ranges to compact
 	minLog, err := r.logs.FirstIndex()
@@ -230,8 +227,8 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 	}
 
 	// Check if we have enough logs to truncate
-	lastLogIdx, _ := r.getLastLog()
-	if lastLogIdx <= r.conf.TrailingLogs {
+	lastLogIdx, _ := r.shared.getLastLog()
+	if lastLogIdx <= Index(r.conf.TrailingLogs) {
 		return nil
 	}
 
@@ -239,10 +236,13 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 	// back from the head, which ever is further back. This ensures
 	// at least `TrailingLogs` entries, but does not allow logs
 	// after the snapshot to be removed.
-	maxLog := min(snapIdx, lastLogIdx-r.conf.TrailingLogs)
+	maxLog := lastLogIdx - Index(r.conf.TrailingLogs)
+	if maxLog > snapIdx {
+		maxLog = snapIdx
+	}
 
 	// Log this
-	r.logger.Printf("[INFO] raft: Compacting logs from %d to %d", minLog, maxLog)
+	r.logger.Info("Compacting logs", "from_index", minLog, "to_index", maxLog)
 
 	// Compact the logs
 	if err := r.logs.DeleteRange(minLog, maxLog); err != nil {

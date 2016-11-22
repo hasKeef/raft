@@ -26,7 +26,7 @@ var (
 // getRPCHeader returns an initialized RPCHeader struct for the given
 // Raft instance. This structure is sent along with RPC requests and
 // responses.
-func (r *Raft) getRPCHeader() RPCHeader {
+func (r *raftServer) getRPCHeader() RPCHeader {
 	return RPCHeader{
 		ProtocolVersion: r.conf.ProtocolVersion,
 	}
@@ -34,7 +34,7 @@ func (r *Raft) getRPCHeader() RPCHeader {
 
 // checkRPCHeader houses logic about whether this instance of Raft can process
 // the given RPC message.
-func (r *Raft) checkRPCHeader(rpc RPC) error {
+func (r *raftServer) checkRPCHeader(rpc RPC) error {
 	// Get the header off the RPC message.
 	wh, ok := rpc.Command.(WithRPCHeader)
 	if !ok {
@@ -92,47 +92,47 @@ type leaderState struct {
 	// the first index of this leader's term: this needs to be replicated to a
 	// majority of the cluster before this leader may mark anything committed
 	// (per Raft's commitment rule)
-	startIndex uint64
+	startIndex Index
 
 	inflight      *list.List // list of logFuture in log index order
 	verifyBatches []verifyBatch
 }
 
 // setLeader is used to modify the current leader of the cluster
-func (r *Raft) setLeader(leader ServerAddress) {
+func (r *raftServer) setLeader(leader ServerAddress) {
 	r.leaderLock.Lock()
 	r.leader = leader
 	r.leaderLock.Unlock()
 }
 
-// requestConfigChange is a helper for the above functions that make
-// configuration change requests. 'req' describes the change. For timeout,
+// requestMembershipChange is a helper for the functions that make
+// membership change requests. 'req' describes the change. For timeout,
 // see AddVoter.
-func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.Duration) IndexFuture {
+func (r *Raft) requestMembershipChange(req membershipChangeRequest, timeout time.Duration) IndexFuture {
 	var timer <-chan time.Time
 	if timeout > 0 {
 		timer = time.After(timeout)
 	}
-	future := &configurationChangeFuture{
+	future := &membershipChangeFuture{
 		req: req,
 	}
 	future.init()
 	select {
 	case <-timer:
 		return errorFuture{ErrEnqueueTimeout}
-	case r.configurationChangeCh <- future:
+	case r.channels.membershipChangeCh <- future:
 		return future
-	case <-r.shutdownCh:
+	case <-r.channels.shutdownCh:
 		return errorFuture{ErrRaftShutdown}
 	}
 }
 
 // run is a long running goroutine that runs the Raft FSM.
-func (r *Raft) run() {
+func (r *raftServer) run() {
 	for {
 		// Check if we are doing a shutdown
 		select {
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 			// Clear the leader to prevent forwarding
 			r.setLeader("")
 			r.shutdownPeers()
@@ -141,7 +141,7 @@ func (r *Raft) run() {
 		}
 
 		// Enter into a sub-FSM
-		switch r.getState() {
+		switch r.shared.getState() {
 		case Follower:
 			r.runFollower()
 		case Candidate:
@@ -153,9 +153,9 @@ func (r *Raft) run() {
 }
 
 // runFollower runs the FSM for a follower.
-func (r *Raft) runFollower() {
+func (r *raftServer) runFollower() {
 	didWarn := false
-	r.logger.Printf("[INFO] raft: %v entering Follower state (Leader: %q)", r, r.Leader())
+	r.logger.Info("Entering Follower state", "leader", r.getLeader())
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
 	heartbeatTimer := randomTimeout(r.conf.HeartbeatTimeout)
 
@@ -166,30 +166,27 @@ func (r *Raft) runFollower() {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
-		case c := <-r.configurationChangeCh:
+		case c := <-r.api.membershipChangeCh:
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
-		case a := <-r.applyCh:
+		case a := <-r.api.applyCh:
 			// Reject any operations since we are not the leader
 			a.respond(ErrNotLeader)
 
-		case v := <-r.verifyCh:
+		case v := <-r.api.verifyCh:
 			// Reject any operations since we are not the leader
 			v.respond(ErrNotLeader)
 
-		case r := <-r.userRestoreCh:
-			// Reject any restores since we are not the leader
-			r.respond(ErrNotLeader)
-
-		case c := <-r.configurationsCh:
-			c.configurations = r.configurations.Clone()
+		case c := <-r.api.membershipsCh:
+			c.memberships = r.memberships.Clone()
 			c.respond(nil)
 
-		case b := <-r.bootstrapCh:
-			b.respond(r.liveBootstrap(b.configuration))
+		case f := <-r.api.statsCh:
+			f.stats = r.stats()
+			f.respond(nil)
 
-		case e := <-r.campaignCh:
+		case e := <-r.api.campaignCh:
 			r.setLeader("")
 
 			if e.runForElection {
@@ -205,34 +202,38 @@ func (r *Raft) runFollower() {
 				e.respond(nil)
 			}
 
+		case b := <-r.api.bootstrapCh:
+			b.respond(r.liveBootstrap(b.membership))
+
 		case <-heartbeatTimer:
 			// Restart the heartbeat timer
 			heartbeatTimer = randomTimeout(r.conf.HeartbeatTimeout)
 
 			// Check if we have had a successful contact
-			lastContact := r.LastContact()
-			if campaign == nil && time.Now().Sub(lastContact) < r.conf.HeartbeatTimeout {
+			lastContact := r.getLastContact()
+			if time.Now().Sub(lastContact) < r.conf.HeartbeatTimeout {
 				continue
 			}
 
 			// Heartbeat failed! Transition to the candidate state
-			lastLeader := r.Leader()
+			lastLeader := r.getLeader()
 			r.setLeader("")
 
-			if r.configurations.latestIndex == 0 {
+			if r.memberships.latestIndex == 0 {
 				if !didWarn {
-					r.logger.Printf("[WARN] raft: no known peers, aborting election")
+					r.logger.Warn("No known peers, aborting election")
 					didWarn = true
 				}
-			} else if r.configurations.latestIndex == r.configurations.committedIndex &&
-				!hasVote(r.configurations.latest, r.localID) {
+			} else if r.memberships.latestIndex == r.memberships.committedIndex &&
+				!hasVote(r.memberships.latest, r.localID) {
 				if !didWarn {
-					r.logger.Printf("[WARN] raft: not part of stable configuration, aborting election")
+					r.logger.Warn("Not part of stable membership configuration, aborting election")
 					didWarn = true
 				}
 			} else {
-				r.logger.Printf(`[WARN] raft: Heartbeat timeout from %q reached in term %d (last contact %v), starting election`,
-					lastLeader, r.getCurrentTerm(), lastContact)
+				r.logger.Warn("Heartbeat timeout reached, starting election",
+					"last_leader", lastLeader, "term", r.currentTerm,
+					"last_contact", lastContact)
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				r.setState(Candidate)
 				if campaign != nil {
@@ -248,7 +249,7 @@ func (r *Raft) runFollower() {
 				campaign = nil
 			}
 
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 			return
 		}
 	}
@@ -257,10 +258,10 @@ func (r *Raft) runFollower() {
 // liveBootstrap attempts to seed an initial configuration for the cluster. See
 // the Raft object's member BootstrapCluster for more details. This must only be
 // called on the main thread, and only makes sense in the follower state.
-func (r *Raft) liveBootstrap(configuration Configuration) error {
+func (r *raftServer) liveBootstrap(membership Membership) error {
 	// Use the pre-init API to make the static updates.
 	err := BootstrapCluster(&r.conf, r.logs, r.stable, r.snapshots,
-		r.trans, configuration)
+		r.trans, membership)
 	if err != nil {
 		return err
 	}
@@ -268,32 +269,34 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 	// Make the configuration live.
 	var entry Log
 	if err := r.logs.GetLog(1, &entry); err != nil {
-		panic(err)
+		r.logger.Fatal("Could not read live-bootstrapped membership entry",
+			"error", err)
 	}
-	r.setCurrentTerm(1)
-	r.setLastLog(entry.Index, entry.Term)
-	r.processConfigurationLogEntry(&entry)
+	r.currentTerm = 1
+	r.persistCurrentTerm()
+	r.shared.setLastLog(entry.Index, entry.Term)
+	r.processMembershipLogEntry(&entry)
 	return nil
 }
 
 // runCandidate runs the FSM for a candidate.
-func (r *Raft) runCandidate() {
-	r.logger.Printf("[INFO] raft: %v entering Candidate state in term %v",
-		r, r.getCurrentTerm()+1)
+func (r *raftServer) runCandidate() {
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
 	defer metrics.MeasureSince([]string{"raft", "candidate", "electSelf"}, time.Now())
 
 	// Increment the term
-	r.setCurrentTerm(r.getCurrentTerm() + 1)
+	r.currentTerm += 1
+	r.persistCurrentTerm()
+	r.logger.Info("Entering Candidate state", "term", r.currentTerm)
 
 	// Set a timeout
 	electionTimer := randomTimeout(r.conf.ElectionTimeout)
 
-	if hasVote(r.configurations.latest, r.localID) {
+	if hasVote(r.memberships.latest, r.localID) {
 		// Persist a vote for ourselves
-		err := r.persistVote(r.getCurrentTerm(), r.trans.EncodePeer(r.localAddr))
+		err := r.persistVote(r.currentTerm, r.trans.EncodePeer(r.localAddr))
 		if err != nil {
-			r.logger.Printf("[ERR] raft: Failed to persist vote : %v", err)
+			r.logger.Error("Failed to persist vote", "error", err)
 			return // TODO: panic?
 		}
 	}
@@ -302,7 +305,7 @@ func (r *Raft) runCandidate() {
 	// Ask peers to vote
 	r.updatePeers()
 
-	for r.getState() == Candidate {
+	for r.shared.getState() == Candidate {
 		select {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
@@ -313,39 +316,40 @@ func (r *Raft) runCandidate() {
 				peer.progress = progress
 				r.computeCandidateProgress()
 			}
-		case e := <-r.campaignCh:
+		case e := <-r.api.campaignCh:
 			// The node is already a candidate
 			e.respond(nil)
-		case c := <-r.configurationChangeCh:
+
+		case c := <-r.api.membershipChangeCh:
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
-		case a := <-r.applyCh:
+		case a := <-r.api.applyCh:
 			// Reject any operations since we are not the leader
 			a.respond(ErrNotLeader)
 
-		case v := <-r.verifyCh:
+		case v := <-r.api.verifyCh:
 			// Reject any operations since we are not the leader
 			v.respond(ErrNotLeader)
 
-		case r := <-r.userRestoreCh:
-			// Reject any restores since we are not the leader
-			r.respond(ErrNotLeader)
-
-		case c := <-r.configurationsCh:
-			c.configurations = r.configurations.Clone()
+		case c := <-r.api.membershipsCh:
+			c.memberships = r.memberships.Clone()
 			c.respond(nil)
 
-		case b := <-r.bootstrapCh:
+		case f := <-r.api.statsCh:
+			f.stats = r.stats()
+			f.respond(nil)
+
+		case b := <-r.api.bootstrapCh:
 			b.respond(ErrCantBootstrap)
 
 		case <-electionTimer:
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
-			r.logger.Printf("[WARN] raft: Election timeout reached, restarting election")
+			r.logger.Warn("Election timeout reached, restarting election")
 			return
 
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 			return
 		}
 	}
@@ -353,8 +357,8 @@ func (r *Raft) runCandidate() {
 
 // runLeader runs the FSM for a leader. Do the setup here and drop into
 // the leaderLoop for the hot loop.
-func (r *Raft) runLeader() {
-	r.logger.Printf("[INFO] raft: %v entering Leader state", r)
+func (r *raftServer) runLeader() {
+	r.logger.Info("Entering Leader state")
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
 	// Notify that we are the leader
@@ -364,13 +368,13 @@ func (r *Raft) runLeader() {
 	if notify := r.conf.NotifyCh; notify != nil {
 		select {
 		case notify <- true:
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 		}
 	}
 
 	// Setup leader state
 	// first index that may be committed in this term
-	r.leaderState.startIndex = r.getLastIndex() + 1
+	r.leaderState.startIndex = r.shared.getLastIndex() + 1
 	r.leaderState.inflight = list.New()
 	r.leaderState.verifyBatches = nil
 
@@ -422,7 +426,7 @@ func (r *Raft) runLeader() {
 		if notify := r.conf.NotifyCh; notify != nil {
 			select {
 			case notify <- false:
-			case <-r.shutdownCh:
+			case <-r.api.shutdownCh:
 				// On shutdown, make a best effort but do not block
 				select {
 				case notify <- false:
@@ -452,20 +456,21 @@ func (r *Raft) runLeader() {
 // updatePeeers will start communication with new peers, send new and
 // existing peers updated control information, and stop communication with
 // removed peers. This must only be called from the main thread.
-func (r *Raft) updatePeers() {
-	inConfig := make(map[ServerID]Server, len(r.configurations.latest.Servers))
+func (r *raftServer) updatePeers() {
+	inConfig := make(map[ServerID]Server, len(r.memberships.latest.Servers))
 
 	// Start replication goroutines that need starting
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range r.memberships.latest.Servers {
 		if server.ID == r.localID {
 			continue
 		}
 		inConfig[server.ID] = server
 		if _, ok := r.peers[server.ID]; !ok {
-			r.logger.Printf("[INFO] raft: Added peer %v, starting replication", server.ID)
+			r.logger.Info("Added peer, starting replication",
+				"id", server.ID, "address", server.Address)
 			controlCh := startPeer(server.ID, server.Address, r.logger, r.logs, r.snapshots,
-				r.goRoutines, r.trans, r.localAddr, r.peerProgressCh, peerOptions{
-					protocolVersion:   r.conf.ProtocolVersion,
+				r.goRoutines, r.trans, r.localAddr, ProtocolVersionMax,
+				r.peerProgressCh, peerOptions{
 					maxAppendEntries:  uint64(r.conf.MaxAppendEntries),
 					heartbeatInterval: r.conf.HeartbeatTimeout / 5,
 				})
@@ -477,9 +482,9 @@ func (r *Raft) updatePeers() {
 	}
 
 	// Send new control information and stop Peer goroutines that need stopping
-	lastIndex, lastTerm := r.getLastEntry()
+	lastIndex, lastTerm := r.shared.getLastEntry()
 	for serverID, peer := range r.peers {
-		role := r.getState()
+		role := r.shared.getState()
 		if role == Shutdown {
 			// Shutdown must be the last control signal sent to the Peer, so we mask
 			// it here and send it later in shutdownPeers().
@@ -488,7 +493,8 @@ func (r *Raft) updatePeers() {
 		verifyCounter := r.verifyCounter
 		server, ok := inConfig[serverID]
 		if !ok {
-			r.logger.Printf("[INFO] raft: Removed peer %v, stopping communication", serverID)
+			r.logger.Info("Removed peer, stopping communication",
+				"id", serverID, "address", server.Address)
 			delete(r.peers, serverID)
 			role = Shutdown
 		} else {
@@ -500,52 +506,52 @@ func (r *Raft) updatePeers() {
 			}
 		}
 		control := peerControl{
-			term:          r.getCurrentTerm(),
+			term:          r.currentTerm,
 			role:          role,
 			verifyCounter: verifyCounter,
 			lastIndex:     lastIndex,
 			lastTerm:      lastTerm,
-			commitIndex:   r.getCommitIndex(),
+			commitIndex:   r.commitIndex,
 		}
 		peer.controlCh <- control
 	}
 }
 
 // shutdownPeers instructs all peers to exit immediately.
-func (r *Raft) shutdownPeers() {
+func (r *raftServer) shutdownPeers() {
 	control := peerControl{
-		term: r.getCurrentTerm(),
+		term: r.currentTerm,
 		role: Shutdown,
 	}
 	for serverID, peer := range r.peers {
-		r.logger.Printf("[INFO] raft: Shutting down communication with peer %v", serverID)
+		r.logger.Info("Shutting down communication with peer", "id", serverID)
 		peer.controlCh <- control
 		delete(r.peers, serverID)
-		r.logger.Printf("[INFO] raft: Shut down communication with peer %v", serverID)
+		r.logger.Info("Shut down communication with peer", "id", serverID)
 	}
 }
 
-// configurationChangeChIfStable returns r.configurationChangeCh if it's safe
+// membershipChangeChIfStable returns r.membershipChangeCh if it's safe
 // to process requests from it, or nil otherwise. This must only be called
 // from the main thread.
 //
 // Note that if the conditions here were to change outside of leaderLoop to take
 // this from nil to non-nil, we would need leaderLoop to be kicked.
-func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
+func (r *raftServer) membershipChangeChIfStable() chan *membershipChangeFuture {
 	// Have to wait until:
 	// 1. The latest configuration is committed, and
 	// 2. This leader has committed some entry (the noop) in this term
 	//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J
-	if r.configurations.latestIndex == r.configurations.committedIndex &&
-		r.getCommitIndex() >= r.leaderState.startIndex {
-		return r.configurationChangeCh
+	if r.memberships.latestIndex == r.memberships.committedIndex &&
+		r.commitIndex >= r.leaderState.startIndex {
+		return r.api.membershipChangeCh
 	}
 	return nil
 }
 
 // leaderLoop is the hot loop for a leader. It is invoked
 // after all the various leader setup is done.
-func (r *Raft) leaderLoop() {
+func (r *raftServer) leaderLoop() {
 	// stepDown is used to track if there is an inflight log that
 	// would cause us to lose leadership (specifically a RemovePeer of
 	// ourselves). If this is the case, we must not allow any logs to
@@ -555,20 +561,20 @@ func (r *Raft) leaderLoop() {
 	stepDown := false
 
 	lease := time.After(r.conf.LeaderLeaseTimeout)
-	for r.getState() == Leader {
+	for r.shared.getState() == Leader {
 		select {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
-		case future := <-r.verifyCh:
+		case future := <-r.api.verifyCh:
 			// Try to batch all queued verifies together.
 			futures := []*verifyFuture{future}
 			drained := false
 			for !drained {
 				select {
-				case another := <-r.verifyCh:
+				case another := <-r.api.verifyCh:
 					futures = append(futures, another)
-				case <-r.shutdownCh:
+				case <-r.api.shutdownCh:
 					return
 				default:
 					drained = true
@@ -576,29 +582,26 @@ func (r *Raft) leaderLoop() {
 			}
 			r.verifyLeader(futures)
 
-		case future := <-r.userRestoreCh:
-			err := r.restoreUserSnapshot(future.meta, future.reader)
-			future.respond(err)
-
-		case c := <-r.configurationsCh:
-			c.configurations = r.configurations.Clone()
+		case c := <-r.api.membershipsCh:
+			c.memberships = r.memberships.Clone()
 			c.respond(nil)
 
-		case future := <-r.configurationChangeChIfStable():
-			r.appendConfigurationEntry(future)
+		case future := <-r.membershipChangeChIfStable():
+			r.appendMembershipEntry(future)
 
-		case b := <-r.bootstrapCh:
+		case f := <-r.api.statsCh:
+			f.stats = r.stats()
+			f.respond(nil)
+
+		case b := <-r.api.bootstrapCh:
 			b.respond(ErrCantBootstrap)
 
-		case e := <-r.campaignCh:
-			e.respond(ErrBadStateForElection)
-
-		case newLog := <-r.applyCh:
+		case newLog := <-r.api.applyCh:
 			// Group commit, gather all the ready commits
 			ready := []*logFuture{newLog}
 			for i := 0; i < r.conf.MaxAppendEntries; i++ {
 				select {
-				case newLog := <-r.applyCh:
+				case newLog := <-r.api.applyCh:
 					ready = append(ready, newLog)
 				default:
 					break
@@ -628,22 +631,25 @@ func (r *Raft) leaderLoop() {
 				r.computeLeaderProgress()
 			}
 
-		case <-r.shutdownCh:
+		case <-r.api.shutdownCh:
 			return
 		}
 
 	}
 }
 
-func (r *Raft) updateCommitIndex(oldCommitIndex, commitIndex uint64) {
+func (r *raftServer) updateCommitIndex(oldCommitIndex, commitIndex Index) {
+	r.logger.Debug("New commit index",
+		"old_index", oldCommitIndex,
+		"new_index", commitIndex)
 	stepDown := false
-	r.setCommitIndex(commitIndex)
+	r.commitIndex = commitIndex
 	// Process the newly committed entries
-	if r.configurations.latestIndex > oldCommitIndex &&
-		r.configurations.latestIndex <= commitIndex {
-		r.configurations.committed = r.configurations.latest
-		r.configurations.committedIndex = r.configurations.latestIndex
-		if !hasVote(r.configurations.committed, r.localID) {
+	if r.memberships.latestIndex > oldCommitIndex &&
+		r.memberships.latestIndex <= commitIndex {
+		r.memberships.committed = r.memberships.latest
+		r.memberships.committedIndex = r.memberships.latestIndex
+		if !hasVote(r.memberships.committed, r.localID) {
 			stepDown = true
 		}
 	}
@@ -666,10 +672,10 @@ func (r *Raft) updateCommitIndex(oldCommitIndex, commitIndex uint64) {
 
 	if stepDown {
 		if r.conf.ShutdownOnRemove {
-			r.logger.Printf("[INFO] raft: Removed ourself, shutting down")
+			r.logger.Info("Removed ourself, shutting down")
 			r.Shutdown()
 		} else {
-			r.logger.Printf("[INFO] raft: Removed ourself, transitioning to follower")
+			r.logger.Info("Removed ourself, transitioning to follower")
 			r.stepDown()
 		}
 	}
@@ -680,7 +686,7 @@ func (r *Raft) updateCommitIndex(oldCommitIndex, commitIndex uint64) {
 // Responds to any verify futures that have been satisfied. A majority of the
 // voting servers in the cluster have acknowledged this server's leadership
 // since the given 'count'.
-func (r *Raft) verified(count uint64) {
+func (r *raftServer) verified(count uint64) {
 	i := 0
 	var batch verifyBatch
 	for _, batch = range r.leaderState.verifyBatches {
@@ -693,71 +699,75 @@ func (r *Raft) verified(count uint64) {
 		i++
 	}
 	if i > 0 {
-		r.logger.Printf("[INFO] raft: Verified leadership through counter %v", count)
+		r.logger.Info("Verified leadership through counter", "count", count)
 		r.leaderState.verifyBatches = r.leaderState.verifyBatches[i:]
 	}
 }
 
-func (r *Raft) computeCandidateProgress() {
-	servers := len(r.configurations.latest.Servers)
+func (r *raftServer) computeCandidateProgress() {
+	servers := len(r.memberships.latest.Servers)
 	votes := make([]uint64, 0, servers)
-	if hasVote(r.configurations.latest, r.localID) {
+	if hasVote(r.memberships.latest, r.localID) {
 		votes = append(votes, 1)
 	}
 	for peerID, peer := range r.peers {
 		switch {
-		case peer.progress.term > r.getCurrentTerm():
-			r.logger.Printf("[DEBUG] raft: Newer term discovered, fallback to follower")
+		case peer.progress.term > r.currentTerm:
+			r.logger.Debug("Newer term discovered, fallback to follower")
 			r.updateTerm(peer.progress.term)
 			return
-		case peer.progress.term == r.getCurrentTerm():
-			if hasVote(r.configurations.latest, peerID) {
+		case peer.progress.term == r.currentTerm:
+			if hasVote(r.memberships.latest, peerID) {
 				if peer.progress.voteGranted {
 					votes = append(votes, 1)
 				} else {
 					votes = append(votes, 0)
 				}
 			}
-		case peer.progress.term < r.getCurrentTerm():
-			votes = append(votes, 0)
+		case peer.progress.term < r.currentTerm:
+			if hasVote(r.memberships.latest, peerID) {
+				votes = append(votes, 0)
+			}
 		}
 	}
 	if quorumGeq(votes) == 1 {
-		r.logger.Printf("[INFO] raft: Election won. Tally: %d", sum(votes))
+		r.logger.Info("Election won", "tally", sum(votes))
 		r.setState(Leader)
 		r.setLeader(r.localAddr)
 		r.updatePeers()
 	}
 }
 
-func (r *Raft) computeLeaderProgress() {
-	servers := len(r.configurations.latest.Servers)
+func (r *raftServer) computeLeaderProgress() {
+	servers := len(r.memberships.latest.Servers)
 	verifiedCounters := make([]uint64, 0, servers)
 	matchIndexes := make([]uint64, 0, servers)
-	if hasVote(r.configurations.latest, r.localID) {
+	if hasVote(r.memberships.latest, r.localID) {
 		verifiedCounters = append(verifiedCounters, r.verifyCounter)
-		matchIndexes = append(matchIndexes, r.getLastIndex())
+		matchIndexes = append(matchIndexes, uint64(r.shared.getLastIndex()))
 	}
 	for peerID, peer := range r.peers {
 		switch {
-		case peer.progress.term > r.getCurrentTerm():
-			r.logger.Printf("[DEBUG] raft: Newer term discovered, fallback to follower")
+		case peer.progress.term > r.currentTerm:
+			r.logger.Debug("Newer term discovered, fallback to follower")
 			r.updateTerm(peer.progress.term)
 			return
-		case peer.progress.term == r.getCurrentTerm():
-			if hasVote(r.configurations.latest, peerID) {
+		case peer.progress.term == r.currentTerm:
+			if hasVote(r.memberships.latest, peerID) {
 				verifiedCounters = append(verifiedCounters, peer.progress.verifiedCounter)
-				matchIndexes = append(matchIndexes, peer.progress.matchIndex)
+				matchIndexes = append(matchIndexes, uint64(peer.progress.matchIndex))
 			}
-		case peer.progress.term < r.getCurrentTerm():
-			verifiedCounters = append(verifiedCounters, 0)
-			matchIndexes = append(matchIndexes, 0)
+		case peer.progress.term < r.currentTerm:
+			if hasVote(r.memberships.latest, peerID) {
+				verifiedCounters = append(verifiedCounters, 0)
+				matchIndexes = append(matchIndexes, 0)
+			}
 		}
 	}
 	verifiedCounter := quorumGeq(verifiedCounters)
-	matchIndex := quorumGeq(matchIndexes)
+	matchIndex := Index(quorumGeq(matchIndexes))
 
-	oldCommitIndex := r.getCommitIndex()
+	oldCommitIndex := r.commitIndex
 	if matchIndex > oldCommitIndex && matchIndex >= r.leaderState.startIndex {
 		r.updateCommitIndex(oldCommitIndex, matchIndex)
 	}
@@ -784,7 +794,7 @@ func sum(values []uint64) uint64 {
 
 // verifyLeader must be called from the main thread for safety.
 // Causes the followers to attempt an immediate heartbeat.
-func (r *Raft) verifyLeader(futures []*verifyFuture) {
+func (r *raftServer) verifyLeader(futures []*verifyFuture) {
 	r.verifyCounter++
 	counter := r.verifyCounter
 	r.leaderState.verifyBatches = append(r.leaderState.verifyBatches, verifyBatch{
@@ -792,8 +802,8 @@ func (r *Raft) verifyLeader(futures []*verifyFuture) {
 		futures: futures,
 	})
 
-	r.logger.Printf("[INFO] raft: Verifying leadership for %v requests with counter %v",
-		len(futures), counter)
+	r.logger.Info("Verifying leadership for with counter",
+		"requests", len(futures), "counter", counter)
 
 	// Trigger immediate heartbeats
 	r.updatePeers()
@@ -806,14 +816,14 @@ func (r *Raft) verifyLeader(futures []*verifyFuture) {
 // within the last leader lease interval. If not, we need to step down,
 // as we may have lost connectivity. Returns the maximum duration without
 // contact. This must only be called from the main thread.
-func (r *Raft) checkLeaderLease() {
-	servers := len(r.configurations.latest.Servers)
+func (r *raftServer) checkLeaderLease() {
+	servers := len(r.memberships.latest.Servers)
 	lastContacts := make([]uint64, 0, servers)
-	if hasVote(r.configurations.latest, r.localID) {
+	if hasVote(r.memberships.latest, r.localID) {
 		lastContacts = append(lastContacts, uint64(time.Now().UnixNano()))
 	}
 	for peerID, peer := range r.peers {
-		if hasVote(r.configurations.latest, peerID) {
+		if hasVote(r.memberships.latest, peerID) {
 			lastContacts = append(lastContacts, uint64(peer.progress.lastContact.UnixNano()))
 		}
 	}
@@ -822,120 +832,27 @@ func (r *Raft) checkLeaderLease() {
 	diff := time.Now().Sub(lastContact)
 	metrics.AddSample([]string{"raft", "leader", "lastContact"}, float32(diff/time.Millisecond))
 	if r.conf.LeaderLeaseTimeout < diff {
-		r.logger.Printf("[WARN] raft: Failed to contact quorum of nodes, stepping down")
+		r.logger.Warn("Failed to contact quorum of nodes, stepping down")
 		r.stepDown()
 		metrics.IncrCounter([]string{"raft", "transition", "leader_lease_timeout"}, 1)
 	}
 }
 
-// restoreUserSnapshot is used to manually consume an external snapshot, such
-// as if restoring from a backup. We will use the current Raft configuration,
-// not the one from the snapshot, so that we can restore into a new cluster. We
-// will also use the higher of the index of the snapshot, or the current index,
-// and then add 1 to that, so we force a new state with a hole in the Raft log,
-// so that the snapshot will be sent to followers and used for any new joiners.
-// This can only be run on the leader, and returns a future that can be used to
-// block until complete.
-func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
-	defer metrics.MeasureSince([]string{"raft", "restoreUserSnapshot"}, time.Now())
-
-	// Sanity check the version.
-	version := meta.Version
-	if version < SnapshotVersionMin || version > SnapshotVersionMax {
-		return fmt.Errorf("unsupported snapshot version %d", version)
-	}
-
-	// We don't support snapshots while there's a config change
-	// outstanding since the snapshot doesn't have a means to
-	// represent this state.
-	committedIndex := r.configurations.committedIndex
-	latestIndex := r.configurations.latestIndex
-	if committedIndex != latestIndex {
-		return fmt.Errorf("cannot restore snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
-			latestIndex, committedIndex)
-	}
-
-	// Cancel any inflight requests.
-	for {
-		e := r.leaderState.inflight.Front()
-		if e == nil {
-			break
-		}
-		e.Value.(*logFuture).respond(ErrAbortedByRestore)
-		r.leaderState.inflight.Remove(e)
-	}
-
-	// We will overwrite the snapshot metadata with the current term,
-	// an index that's greater than the current index, or the last
-	// index in the snapshot. It's important that we leave a hole in
-	// the index so we know there's nothing in the Raft log there and
-	// replication will fault and send the snapshot.
-	term := r.getCurrentTerm()
-	lastIndex := r.getLastIndex()
-	if meta.Index > lastIndex {
-		lastIndex = meta.Index
-	}
-	lastIndex++
-
-	// Dump the snapshot. Note that we use the latest configuration,
-	// not the one that came with the snapshot.
-	sink, err := r.snapshots.Create(version, lastIndex, term,
-		r.configurations.latest, r.configurations.latestIndex, r.trans)
-	if err != nil {
-		return fmt.Errorf("failed to create snapshot: %v", err)
-	}
-	n, err := io.Copy(sink, reader)
-	if err != nil {
-		sink.Cancel()
-		return fmt.Errorf("failed to write snapshot: %v", err)
-	}
-	if n != meta.Size {
-		sink.Cancel()
-		return fmt.Errorf("failed to write snapshot, size didn't match (%d != %d)", n, meta.Size)
-	}
-	if err := sink.Close(); err != nil {
-		return fmt.Errorf("failed to close snapshot: %v", err)
-	}
-	r.logger.Printf("[INFO] raft: Copied %d bytes to local snapshot", n)
-
-	// Restore the snapshot into the FSM. If this fails we are in a
-	// bad state so we panic to take ourselves out.
-	fsm := &restoreFuture{ID: sink.ID()}
-	fsm.init()
-	select {
-	case r.fsmMutateCh <- fsm:
-	case <-r.shutdownCh:
-		return ErrRaftShutdown
-	}
-	if err := fsm.Error(); err != nil {
-		panic(fmt.Errorf("failed to restore snapshot: %v", err))
-	}
-
-	// We set the last log so it looks like we've stored the empty
-	// index we burned. The last applied is set because we made the
-	// FSM take the snapshot state, and we store the last snapshot
-	// in the stable store since we created a snapshot as part of
-	// this process.
-	r.setLastLog(lastIndex, term)
-	r.setLastApplied(lastIndex)
-	r.setLastSnapshot(lastIndex, term)
-
-	r.logger.Printf("[INFO] raft: Restored user snapshot (index %d)", lastIndex)
-	return nil
-}
-
-// appendConfigurationEntry changes the configuration and adds a new
+// appendMembershipEntry changes the configuration and adds a new membership
 // configuration entry to the log. This must only be called from the
 // main thread.
-func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
-	configuration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)
+func (r *raftServer) appendMembershipEntry(future *membershipChangeFuture) {
+	membership, err := nextMembership(r.memberships.latest, r.memberships.latestIndex, future.req)
 	if err != nil {
 		future.respond(err)
 		return
 	}
 
-	r.logger.Printf("[INFO] raft: Updating configuration with %s (%v, %v) to %+v",
-		future.req.command, future.req.serverID, future.req.serverAddress, configuration.Servers)
+	r.logger.Info("Updating membership configuration",
+		"command", future.req.command,
+		"id", future.req.serverID,
+		"address", future.req.serverAddress,
+		"servers", membership.Servers)
 
 	// In pre-ID compatibility mode we translate all configuration changes
 	// in to an old remove peer message, which can handle all supported
@@ -947,12 +864,12 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	if r.protocolVersion < 2 {
 		future.log = Log{
 			Type: LogRemovePeerDeprecated,
-			Data: encodePeers(configuration, r.trans),
+			Data: encodePeers(membership, r.trans),
 		}
 	} else {
 		future.log = Log{
 			Type: LogConfiguration,
-			Data: encodeConfiguration(configuration),
+			Data: encodeMembership(membership),
 		}
 	}
 
@@ -961,36 +878,30 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 
 // dispatchLog is called on the leader to push a log to disk, mark it
 // as inflight and begin replication of it.
-func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
+func (r *raftServer) dispatchLogs(applyLogs []*logFuture) {
 	now := time.Now()
 	defer metrics.MeasureSince([]string{"raft", "leader", "dispatchLog"}, now)
 
-	term := r.getCurrentTerm()
-	lastIndex := r.getLastIndex()
+	lastIndex := r.shared.getLastIndex()
 	logs := make([]*Log, len(applyLogs))
 
 	for idx, applyLog := range applyLogs {
 		applyLog.dispatch = now
 		lastIndex++
 		applyLog.log.Index = lastIndex
-		applyLog.log.Term = term
+		applyLog.log.Term = r.currentTerm
 		logs[idx] = &applyLog.log
 		r.leaderState.inflight.PushBack(applyLog)
-		r.processConfigurationLogEntry(&applyLog.log)
+		r.processMembershipLogEntry(&applyLog.log)
 	}
 
 	// Write the log entry locally
 	if err := r.logs.StoreLogs(logs); err != nil {
-		r.logger.Printf("[ERR] raft: Failed to commit logs: %v", err)
-		for _, applyLog := range applyLogs {
-			applyLog.respond(err)
-		}
-		r.stepDown()
-		return
+		r.logger.Fatal("Failed to store log entries", "error", err)
 	}
 
 	// Update the last log since it's on disk now
-	r.setLastLog(lastIndex, term)
+	r.shared.setLastLog(lastIndex, r.currentTerm)
 
 	// In case we're a 1-server cluster, this might be committed already.
 	r.computeLeaderProgress()
@@ -1006,16 +917,15 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 // pass future=nil.
 // Leaders call this once per inflight when entries are committed. They pass
 // the future from inflights.
-func (r *Raft) processLogs(index uint64, future *logFuture) {
+func (r *raftServer) processLogs(index Index, future *logFuture) {
 	// Reject logs we've applied already
-	lastApplied := r.getLastApplied()
-	if index <= lastApplied {
-		r.logger.Printf("[WARN] raft: Skipping application of old log: %d", index)
+	if index <= r.lastApplied {
+		r.logger.Warn("Skipping application of old log", "index", index)
 		return
 	}
 
 	// Apply all the preceding logs
-	for idx := r.getLastApplied() + 1; idx <= index; idx++ {
+	for idx := r.lastApplied + 1; idx <= index; idx++ {
 		// Get the log, either from the future or from our log store
 		if future != nil && future.log.Index == idx {
 			r.processLog(&future.log, future)
@@ -1023,19 +933,19 @@ func (r *Raft) processLogs(index uint64, future *logFuture) {
 		} else {
 			l := new(Log)
 			if err := r.logs.GetLog(idx, l); err != nil {
-				r.logger.Printf("[ERR] raft: Failed to get log at %d: %v", idx, err)
-				panic(err)
+				r.logger.Fatal("Failed to get log entry",
+					"index", idx, "error", err)
 			}
 			r.processLog(l, nil)
 		}
 
 		// Update the lastApplied index and term
-		r.setLastApplied(idx)
+		r.lastApplied = idx
 	}
 }
 
 // processLog is invoked to process the application of a single committed log entry.
-func (r *Raft) processLog(l *Log, future *logFuture) {
+func (r *raftServer) processLog(l *Log, future *logFuture) {
 	switch l.Type {
 	case LogBarrier:
 		// Barrier is handled by the FSM
@@ -1044,8 +954,8 @@ func (r *Raft) processLog(l *Log, future *logFuture) {
 	case LogCommand:
 		// Forward to the fsm handler
 		select {
-		case r.fsmMutateCh <- &commitTuple{l, future}:
-		case <-r.shutdownCh:
+		case r.fsmCommitCh <- commitTuple{l, future}:
+		case <-r.api.shutdownCh:
 			if future != nil {
 				future.respond(ErrRaftShutdown)
 			}
@@ -1073,7 +983,7 @@ func (r *Raft) processLog(l *Log, future *logFuture) {
 
 // processRPC is called to handle an incoming RPC request. This must only be
 // called from the main thread.
-func (r *Raft) processRPC(rpc RPC) {
+func (r *raftServer) processRPC(rpc RPC) {
 	if err := r.checkRPCHeader(rpc); err != nil {
 		rpc.Respond(nil, err)
 		return
@@ -1087,7 +997,7 @@ func (r *Raft) processRPC(rpc RPC) {
 	case *InstallSnapshotRequest:
 		r.installSnapshot(rpc, cmd)
 	default:
-		r.logger.Printf("[ERR] raft: Got unexpected command: %#v", rpc.Command)
+		r.logger.Error("Got unexpected command", "command", rpc.Command)
 		rpc.Respond(nil, fmt.Errorf("unexpected command"))
 	}
 }
@@ -1095,12 +1005,12 @@ func (r *Raft) processRPC(rpc RPC) {
 // processHeartbeat is a special handler used just for heartbeat requests
 // so that they can be fast-pathed if a transport supports it. This must only
 // be called from the main thread.
-func (r *Raft) processHeartbeat(rpc RPC) {
+func (r *raftServer) processHeartbeat(rpc RPC) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "processHeartbeat"}, time.Now())
 
 	// Check if we are shutdown, just ignore the RPC
 	select {
-	case <-r.shutdownCh:
+	case <-r.api.shutdownCh:
 		return
 	default:
 	}
@@ -1110,20 +1020,20 @@ func (r *Raft) processHeartbeat(rpc RPC) {
 	case *AppendEntriesRequest:
 		r.appendEntries(rpc, cmd)
 	default:
-		r.logger.Printf("[ERR] raft: Expected heartbeat, got command: %#v", rpc.Command)
+		r.logger.Error("Expected heartbeat, got command", "command", rpc.Command)
 		rpc.Respond(nil, fmt.Errorf("unexpected command"))
 	}
 }
 
 // appendEntries is invoked when we get an append entries RPC call. This must
 // only be called from the main thread.
-func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+func (r *raftServer) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "appendEntries"}, time.Now())
 	// Setup a response
 	resp := &AppendEntriesResponse{
 		RPCHeader: r.getRPCHeader(),
-		Term:      r.getCurrentTerm(),
-		LastLog:   r.getLastIndex(),
+		Term:      r.currentTerm,
+		LastLog:   r.shared.getLastIndex(),
 		Success:   false,
 	}
 	var rpcErr error
@@ -1132,13 +1042,13 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	}()
 
 	// Ignore an older term
-	if a.Term < r.getCurrentTerm() {
+	if a.Term < r.currentTerm {
 		return
 	}
 
 	// Increase the term if we see a newer one, also transition to follower
 	// if we ever get an appendEntries call
-	if a.Term > r.getCurrentTerm() {
+	if a.Term > r.currentTerm {
 		r.updateTerm(a.Term)
 		resp.Term = a.Term
 	}
@@ -1149,25 +1059,34 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// Verify the last log entry
 	if a.PrevLogEntry > 0 {
-		lastIdx, lastTerm := r.getLastEntry()
+		lastIdx, lastTerm := r.shared.getLastEntry()
 
-		var prevLogTerm uint64
+		var prevLogTerm Term
 		if a.PrevLogEntry == lastIdx {
 			prevLogTerm = lastTerm
 
 		} else {
 			var prevLog Log
 			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
-				r.logger.Printf("[WARN] raft: Failed to get previous log entry %d: %v (last: %d)",
-					a.PrevLogEntry, err, lastIdx)
-				return
+				if err == ErrLogNotFound {
+					r.logger.Warn("Failed to get previous log entry",
+						"prev_index", a.PrevLogEntry,
+						"last_index", lastIdx,
+						"error", err)
+					return
+				}
+				r.logger.Fatal("Failed to get previous log entry",
+					"prev_index", a.PrevLogEntry,
+					"last_index", lastIdx,
+					"error", err)
 			}
 			prevLogTerm = prevLog.Term
 		}
 
 		if a.PrevLogTerm != prevLogTerm {
-			r.logger.Printf("[WARN] raft: Previous log term mis-match: ours: %d remote: %d",
-				prevLogTerm, a.PrevLogTerm)
+			r.logger.Warn("Previous log term mis-match",
+				"our_term", prevLogTerm,
+				"their_term", a.PrevLogTerm)
 			return
 		}
 	}
@@ -1177,7 +1096,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		start := time.Now()
 
 		// Delete any conflicting entries, skip any duplicates
-		lastLogIdx, _ := r.getLastLog()
+		lastLogIdx, _ := r.shared.getLastLog()
 		var newEntries []*Log
 		for i, entry := range a.Entries {
 			if entry.Index > lastLogIdx {
@@ -1186,19 +1105,18 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 			}
 			var storeEntry Log
 			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
-				r.logger.Printf("[WARN] raft: Failed to get log entry %d: %v",
-					entry.Index, err)
-				return
+				r.logger.Fatal("Failed to get log entry",
+					"index", entry.Index, "error", err)
 			}
 			if entry.Term != storeEntry.Term {
-				r.logger.Printf("[WARN] raft: Clearing log suffix from %d to %d", entry.Index, lastLogIdx)
+				r.logger.Warn("Clearing log suffix",
+					"from_index", entry.Index, "to_index", lastLogIdx)
 				if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
-					r.logger.Printf("[ERR] raft: Failed to clear log suffix: %v", err)
-					return
+					r.logger.Fatal("Failed to clear log suffix", "error", err)
 				}
-				if entry.Index <= r.configurations.latestIndex {
-					r.configurations.latest = r.configurations.committed
-					r.configurations.latestIndex = r.configurations.committedIndex
+				if entry.Index <= r.memberships.latestIndex {
+					r.memberships.latest = r.memberships.committed
+					r.memberships.latestIndex = r.memberships.committedIndex
 					r.updatePeers()
 				}
 				newEntries = a.Entries[i:]
@@ -1209,35 +1127,32 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		if n := len(newEntries); n > 0 {
 			// Append the new entries
 			if err := r.logs.StoreLogs(newEntries); err != nil {
-				r.logger.Printf("[ERR] raft: Failed to append to logs: %v", err)
-				// TODO: leaving r.getLastLog() in the wrong
-				// state if there was a truncation above
-				return
+				r.logger.Fatal("Failed to append to logs", "error", err)
 			}
 
 			// Handle any new configuration changes
 			for _, newEntry := range newEntries {
-				r.processConfigurationLogEntry(newEntry)
+				r.processMembershipLogEntry(newEntry)
 			}
 
 			// Update the lastLog
 			last := newEntries[n-1]
-			r.setLastLog(last.Index, last.Term)
+			r.shared.setLastLog(last.Index, last.Term)
 		}
 
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogs"}, start)
 	}
 
 	// Update the commit index (see comment in AppendEntriesRequest).
-	if cap := a.PrevLogEntry + uint64(len(a.Entries)); a.LeaderCommitIndex > cap {
+	if cap := a.PrevLogEntry + Index(len(a.Entries)); a.LeaderCommitIndex > cap {
 		a.LeaderCommitIndex = cap
 	}
-	if a.LeaderCommitIndex > r.getCommitIndex() {
+	if a.LeaderCommitIndex > r.commitIndex {
 		start := time.Now()
-		r.setCommitIndex(a.LeaderCommitIndex)
-		if r.configurations.latestIndex <= a.LeaderCommitIndex {
-			r.configurations.committed = r.configurations.latest
-			r.configurations.committedIndex = r.configurations.latestIndex
+		r.commitIndex = a.LeaderCommitIndex
+		if r.memberships.latestIndex <= a.LeaderCommitIndex {
+			r.memberships.committed = r.memberships.latest
+			r.memberships.committedIndex = r.memberships.latestIndex
 		}
 		r.processLogs(a.LeaderCommitIndex, nil)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
@@ -1248,33 +1163,33 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	return
 }
 
-// processConfigurationLogEntry takes a log entry and updates the latest
-// configuration if the entry results in a new configuration. This must only be
+// processMembershipLogEntry takes a log entry and updates the latest
+// membership if the entry results in a new membership. This must only be
 // called from the main thread, or from NewRaft() before any threads have begun.
-func (r *Raft) processConfigurationLogEntry(entry *Log) {
+func (r *raftServer) processMembershipLogEntry(entry *Log) {
 	if entry.Type == LogConfiguration {
-		r.configurations.committed = r.configurations.latest
-		r.configurations.committedIndex = r.configurations.latestIndex
-		r.configurations.latest = decodeConfiguration(entry.Data)
-		r.configurations.latestIndex = entry.Index
+		r.memberships.committed = r.memberships.latest
+		r.memberships.committedIndex = r.memberships.latestIndex
+		r.memberships.latest = decodeMembership(entry.Data)
+		r.memberships.latestIndex = entry.Index
 	} else if entry.Type == LogAddPeerDeprecated || entry.Type == LogRemovePeerDeprecated {
-		r.configurations.committed = r.configurations.latest
-		r.configurations.committedIndex = r.configurations.latestIndex
-		r.configurations.latest = decodePeers(entry.Data, r.trans)
-		r.configurations.latestIndex = entry.Index
+		r.memberships.committed = r.memberships.latest
+		r.memberships.committedIndex = r.memberships.latestIndex
+		r.memberships.latest = decodePeers(entry.Data, r.trans)
+		r.memberships.latestIndex = entry.Index
 	}
 	r.updatePeers()
 }
 
 // requestVote is invoked when we get an request vote RPC call.
-func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+func (r *raftServer) requestVote(rpc RPC, req *RequestVoteRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
 	r.observe(*req)
 
 	// Setup a response
 	resp := &RequestVoteResponse{
 		RPCHeader: r.getRPCHeader(),
-		Term:      r.getCurrentTerm(),
+		Term:      r.currentTerm,
 		Granted:   false,
 	}
 	var rpcErr error
@@ -1285,69 +1200,76 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// Version 0 servers will panic unless the peers is present. It's only
 	// used on them to produce a warning message.
 	if r.protocolVersion < 2 {
-		resp.Peers = encodePeers(r.configurations.latest, r.trans)
+		resp.Peers = encodePeers(r.memberships.latest, r.trans)
 	}
 
 	// Check if we have an existing leader [who's not the candidate]
 	candidate := r.trans.DecodePeer(req.Candidate)
-	if leader := r.Leader(); leader != "" && leader != candidate {
-		r.logger.Printf("[WARN] raft: Rejecting vote request from %v since we have a leader: %v",
-			candidate, leader)
+	if leader := r.getLeader(); leader != "" && leader != candidate {
+		r.logger.Warn("Rejecting vote request since we have a leader",
+			"candidate", candidate, "leader", leader)
 		return
 	}
 
 	// Ignore an older term
-	if req.Term < r.getCurrentTerm() {
+	if req.Term < r.currentTerm {
 		return
 	}
 
 	// Increase the term if we see a newer one
-	if req.Term > r.getCurrentTerm() {
+	if req.Term > r.currentTerm {
 		r.updateTerm(req.Term)
 		resp.Term = req.Term
 	}
 
 	// Check if we have voted yet
-	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+	v, err := r.stable.GetUint64(keyLastVoteTerm)
+	lastVoteTerm := Term(v)
 	if err != nil && err.Error() != "not found" {
-		r.logger.Printf("[ERR] raft: Failed to get last vote term: %v", err)
+		r.logger.Error("Failed to get last vote term", "error", err)
 		return
 	}
 	lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
 	if err != nil && err.Error() != "not found" {
-		r.logger.Printf("[ERR] raft: Failed to get last vote candidate: %v", err)
+		r.logger.Error("Failed to get last vote candidate", "error", err)
 		return
 	}
 
 	// Check if we've voted in this election before
 	if lastVoteTerm == req.Term {
 		if lastVoteCandBytes != nil && bytes.Compare(lastVoteCandBytes, req.Candidate) == 0 {
-			r.logger.Printf("[WARN] raft: Duplicate RequestVote in term %d from candidate %s", req.Term, req.Candidate)
+			r.logger.Warn("Duplicate RequestVote", "term", req.Term, "candidate", req.Candidate)
 			resp.Granted = true
 		} else {
-			r.logger.Printf("[INFO] raft: Already voted for %s, cannot grant vote in term %d to candidate %s",
-				lastVoteCandBytes, req.Term, req.Candidate)
+			r.logger.Info("Already voted, cannot grant new vote",
+				"voted_for", lastVoteCandBytes,
+				"rejected_term", req.Term,
+				"rejected_candidate", req.Candidate)
 		}
 		return
 	}
 
 	// Reject if their term is older
-	lastIdx, lastTerm := r.getLastEntry()
+	lastIdx, lastTerm := r.shared.getLastEntry()
 	if lastTerm > req.LastLogTerm {
-		r.logger.Printf("[WARN] raft: Rejecting vote request from %v since our last term is greater (%d, %d)",
-			candidate, lastTerm, req.LastLogTerm)
+		r.logger.Warn("Rejecting vote request since our last term is greater",
+			"last_term", lastTerm,
+			"rejected_term", req.LastLogTerm,
+			"rejected_candidate", candidate)
 		return
 	}
 
 	if lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {
-		r.logger.Printf("[WARN] raft: Rejecting vote request from %v since our last index is greater (%d, %d)",
-			candidate, lastIdx, req.LastLogIndex)
+		r.logger.Warn("Rejecting vote request since our last index is greater",
+			"last_index", lastIdx,
+			"rejected_index", req.LastLogIndex,
+			"rejected_candidate", candidate)
 		return
 	}
 
 	// Persist a vote for safety
 	if err := r.persistVote(req.Term, req.Candidate); err != nil {
-		r.logger.Printf("[ERR] raft: Failed to persist vote: %v", err)
+		r.logger.Error("Failed to persist vote", "error", err)
 		return
 	}
 
@@ -1360,11 +1282,11 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 // We must be in the follower state for this, since it means we are
 // too far behind a leader for log replay. This must only be called
 // from the main thread.
-func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
+func (r *raftServer) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	defer metrics.MeasureSince([]string{"raft", "rpc", "installSnapshot"}, time.Now())
 	// Setup a response
 	resp := &InstallSnapshotResponse{
-		Term:    r.getCurrentTerm(),
+		Term:    r.currentTerm,
 		Success: false,
 	}
 	var rpcErr error
@@ -1380,12 +1302,12 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}
 
 	// Ignore an older term
-	if req.Term < r.getCurrentTerm() {
+	if req.Term < r.currentTerm {
 		return
 	}
 
 	// Increase the term if we see a newer one
-	if req.Term > r.getCurrentTerm() {
+	if req.Term > r.currentTerm {
 		r.updateTerm(req.Term)
 		resp.Term = req.Term
 	}
@@ -1395,10 +1317,10 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	defer r.setLastContact()
 
 	// Create a new snapshot
-	var reqConfiguration Configuration
-	var reqConfigurationIndex uint64
+	var reqConfiguration Membership
+	var reqConfigurationIndex Index
 	if req.SnapshotVersion > 0 {
-		reqConfiguration = decodeConfiguration(req.Configuration)
+		reqConfiguration = decodeMembership(req.Configuration)
 		reqConfigurationIndex = req.ConfigurationIndex
 	} else {
 		reqConfiguration = decodePeers(req.Peers, r.trans)
@@ -1408,7 +1330,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
 		reqConfiguration, reqConfigurationIndex, r.trans)
 	if err != nil {
-		r.logger.Printf("[ERR] raft: Failed to create snapshot to install: %v", err)
+		r.logger.Error("Failed to create snapshot to install", "error", err)
 		rpcErr = fmt.Errorf("failed to create snapshot: %v", err)
 		return
 	}
@@ -1417,7 +1339,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	n, err := io.Copy(sink, rpc.Reader)
 	if err != nil {
 		sink.Cancel()
-		r.logger.Printf("[ERR] raft: Failed to copy snapshot: %v", err)
+		r.logger.Error("Failed to copy snapshot", "error", err)
 		rpcErr = err
 		return
 	}
@@ -1425,61 +1347,62 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	// Check that we received it all
 	if n != req.Size {
 		sink.Cancel()
-		r.logger.Printf("[ERR] raft: Failed to receive whole snapshot: %d / %d", n, req.Size)
+		r.logger.Error("Failed to receive whole snapshot",
+			"received_size", n, "expected_size", req.Size)
 		rpcErr = fmt.Errorf("short read")
 		return
 	}
 
 	// Finalize the snapshot
 	if err := sink.Close(); err != nil {
-		r.logger.Printf("[ERR] raft: Failed to finalize snapshot: %v", err)
+		r.logger.Error("Failed to finalize snapshot", "error", err)
 		rpcErr = err
 		return
 	}
-	r.logger.Printf("[INFO] raft: Copied %d bytes to local snapshot", n)
+	r.logger.Info("Wrote local snapshot", "size", n)
 
 	// Restore snapshot
 	future := &restoreFuture{ID: sink.ID()}
 	future.init()
 	select {
-	case r.fsmMutateCh <- future:
-	case <-r.shutdownCh:
+	case r.fsmRestoreCh <- future:
+	case <-r.api.shutdownCh:
 		future.respond(ErrRaftShutdown)
 		return
 	}
 
 	// Wait for the restore to happen
 	if err := future.Error(); err != nil {
-		r.logger.Printf("[ERR] raft: Failed to restore snapshot: %v", err)
+		r.logger.Error("Failed to restore snapshot", "error", err)
 		rpcErr = err
 		return
 	}
 
 	// Update the lastApplied so we don't replay old logs
-	r.setLastApplied(req.LastLogIndex)
+	r.lastApplied = req.LastLogIndex
 
 	// Update the last stable snapshot info
-	r.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)
+	r.shared.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)
 
 	// Restore the peer set
-	r.configurations.latest = reqConfiguration
-	r.configurations.latestIndex = reqConfigurationIndex
-	r.configurations.committed = reqConfiguration
-	r.configurations.committedIndex = reqConfigurationIndex
+	r.memberships.latest = reqConfiguration
+	r.memberships.latestIndex = reqConfigurationIndex
+	r.memberships.committed = reqConfiguration
+	r.memberships.committedIndex = reqConfigurationIndex
 	r.updatePeers()
 
 	// Compact logs, continue even if this fails
 	if err := r.compactLogs(req.LastLogIndex); err != nil {
-		r.logger.Printf("[ERR] raft: Failed to compact logs: %v", err)
+		r.logger.Error("Failed to compact logs", "error", err)
 	}
 
-	r.logger.Printf("[INFO] raft: Installed remote snapshot")
+	r.logger.Info("Installed remote snapshot")
 	resp.Success = true
 	return
 }
 
 // setLastContact is used to set the last contact time to now
-func (r *Raft) setLastContact() {
+func (r *raftServer) setLastContact() {
 	r.lastContactLock.Lock()
 	r.lastContact = time.Now()
 	r.lastContactLock.Unlock()
@@ -1491,8 +1414,8 @@ type voteResult struct {
 }
 
 // persistVote is used to persist our vote for safety.
-func (r *Raft) persistVote(term uint64, candidate []byte) error {
-	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
+func (r *raftServer) persistVote(term Term, candidate []byte) error {
+	if err := r.stable.SetUint64(keyLastVoteTerm, uint64(term)); err != nil {
 		return err
 	}
 	if err := r.stable.Set(keyLastVoteCand, candidate); err != nil {
@@ -1501,43 +1424,89 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	return nil
 }
 
-func (r *Raft) stepDown() {
-	if r.getState() != Follower {
+func (r *raftServer) stepDown() {
+	if r.shared.getState() != Follower {
 		r.setState(Follower)
 		r.updatePeers()
 	}
 }
 
-func (r *Raft) updateTerm(term uint64) {
+func (r *raftServer) updateTerm(term Term) {
 	r.setState(Follower)
-	oldTerm := r.getCurrentTerm()
-	if term > oldTerm {
-		r.setCurrentTerm(term)
-	} else if term < oldTerm {
+	if term > r.currentTerm {
+		r.currentTerm = term
+		r.persistCurrentTerm()
+	} else if term < r.currentTerm {
 		panic("Can't step down to older term")
 	}
 	r.updatePeers()
 }
 
-// setCurrentTerm is used to set the current term in a durable manner.
+// persistCurrentTerm is used to save the current term in a durable manner.
 // The caller must call updatePeers() after changing the term.
-func (r *Raft) setCurrentTerm(t uint64) {
+func (r *raftServer) persistCurrentTerm() {
 	// Persist to disk first
-	if err := r.stable.SetUint64(keyCurrentTerm, t); err != nil {
+	if err := r.stable.SetUint64(keyCurrentTerm, uint64(r.currentTerm)); err != nil {
 		panic(fmt.Errorf("failed to save current term: %v", err))
 	}
-	r.raftState.setCurrentTerm(t)
 }
 
 // setState is used to update the current state. Any state
 // transition causes the known leader to be cleared. This means
 // that leader should be set only after updating the state.
 // The caller must call updatePeers() after changing the term.
-func (r *Raft) setState(state RaftState) {
+func (r *raftServer) setState(state RaftState) {
 	r.setLeader("")
-	oldState := r.raftState.getState()
-	r.raftState.setState(state)
+	oldState := r.shared.getState()
+	r.shared.setState(state)
 	if oldState != state {
 		r.observe(state)
 	}
+}
+
+// Fills in stats when requested by application.
+// Must only be called from the main Raft goroutine.
+func (r *raftServer) stats() *Stats {
+	lastLogIndex, lastLogTerm := r.shared.getLastLog()
+	lastSnapIndex, lastSnapTerm := r.shared.getLastSnapshot()
+	s := &Stats{
+		State:              r.shared.getState(),
+		Term:               r.currentTerm,
+		LastLogIndex:       lastLogIndex,
+		LastLogTerm:        lastLogTerm,
+		CommitIndex:        r.commitIndex,
+		AppliedIndex:       r.lastApplied,
+		FSMPending:         len(r.fsmCommitCh),
+		LastSnapshotIndex:  lastSnapIndex,
+		LastSnapshotTerm:   lastSnapTerm,
+		LastContact:        r.getLastContact(),
+		ProtocolVersion:    r.protocolVersion,
+		ProtocolVersionMin: ProtocolVersionMin,
+		ProtocolVersionMax: ProtocolVersionMax,
+		SnapshotVersionMin: SnapshotVersionMin,
+		SnapshotVersionMax: SnapshotVersionMax,
+	}
+
+	membership := r.memberships.latest
+	s.LatestMembershipIndex = r.memberships.latestIndex
+	s.LatestMembership = membership
+
+	// This is a legacy metric that we've seen people use in the wild.
+	hasUs := false
+	numPeers := 0
+	for _, server := range membership.Servers {
+		if server.Suffrage == Voter {
+			if server.ID == r.localID {
+				hasUs = true
+			} else {
+				numPeers++
+			}
+		}
+	}
+	if !hasUs {
+		numPeers = 0
+	}
+	s.NumPeers = numPeers
+
+	return s
 }

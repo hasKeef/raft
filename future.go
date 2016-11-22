@@ -1,11 +1,6 @@
 package raft
 
-import (
-	"fmt"
-	"io"
-	"sync"
-	"time"
-)
+import "time"
 
 // Future is used to represent an action that may occur in the future.
 type Future interface {
@@ -25,7 +20,7 @@ type IndexFuture interface {
 
 	// Index holds the index of the newly applied log entry.
 	// This must not be called until after the Error method has returned.
-	Index() uint64
+	Index() Index
 }
 
 // ApplyFuture is used for Apply and can return the FSM response.
@@ -38,24 +33,14 @@ type ApplyFuture interface {
 	Response() interface{}
 }
 
-// ConfigurationFuture is used for GetConfiguration and can return the
-// latest configuration in use by Raft.
-type ConfigurationFuture interface {
+// MembershipFuture is used for GetMembership and can return the
+// latest membership configuration in use by Raft.
+type MembershipFuture interface {
 	IndexFuture
 
-	// Configuration contains the latest configuration. This must
+	// Membership contains the latest membership. This must
 	// not be called until after the Error method has returned.
-	Configuration() Configuration
-}
-
-// SnapshotFuture is used for waiting on a user-triggered snapshot to complete.
-type SnapshotFuture interface {
-	Future
-
-	// Open is a function you can call to access the underlying snapshot and
-	// its metadata. This must not be called until after the Error method
-	// has returned.
-	Open() (*SnapshotMeta, io.ReadCloser, error)
+	Membership() Membership
 }
 
 // errorFuture is used to return a static error.
@@ -71,7 +56,7 @@ func (e errorFuture) Response() interface{} {
 	return nil
 }
 
-func (e errorFuture) Index() uint64 {
+func (e errorFuture) Index() Index {
 	return 0
 }
 
@@ -81,6 +66,9 @@ type deferError struct {
 	err       error
 	errCh     chan error
 	responded bool
+	// Optional. Closed on shutdown. Useful when the future might get stuck in a
+	// buffered channel somewhere.
+	shutdownCh chan struct{}
 }
 
 func (d *deferError) init() {
@@ -97,7 +85,11 @@ func (d *deferError) Error() error {
 	if d.errCh == nil {
 		panic("waiting for response on nil channel")
 	}
-	d.err = <-d.errCh
+	select {
+	case d.err = <-d.errCh:
+	case <-d.shutdownCh:
+		d.err = ErrRaftShutdown
+	}
 	return d.err
 }
 
@@ -113,12 +105,12 @@ func (d *deferError) respond(err error) {
 	d.responded = true
 }
 
-// There are several types of requests that cause a configuration entry to
-// be appended to the log. These are encoded here for leaderLoop() to process.
+// membershipChangeFuture is to track a membership configuration change that is
+// being applied to the log. These are encoded here for leaderLoop() to process.
 // This is internal to a single server.
-type configurationChangeFuture struct {
+type membershipChangeFuture struct {
 	logFuture
-	req configurationChangeRequest
+	req membershipChangeRequest
 }
 
 // bootstrapFuture is used to attempt a live bootstrap of the cluster. See the
@@ -126,8 +118,8 @@ type configurationChangeFuture struct {
 type bootstrapFuture struct {
 	deferError
 
-	// configuration is the proposed bootstrap configuration to apply.
-	configuration Configuration
+	// membership is the proposed bootstrap membership configuration to apply.
+	membership Membership
 }
 
 // logFuture is used to apply a log entry and waits until
@@ -143,7 +135,7 @@ func (l *logFuture) Response() interface{} {
 	return l.response
 }
 
-func (l *logFuture) Index() uint64 {
+func (l *logFuture) Index() Index {
 	return l.log.Index
 }
 
@@ -155,48 +147,16 @@ func (s *shutdownFuture) Error() error {
 	if s.raft == nil {
 		return nil
 	}
-	s.raft.goRoutines.waitShutdown()
-	if closeable, ok := s.raft.trans.(WithClose); ok {
+	s.raft.server.goRoutines.waitShutdown()
+	if closeable, ok := s.raft.server.trans.(WithClose); ok {
 		closeable.Close()
 	}
 	return nil
 }
 
-// userSnapshotFuture is used for waiting on a user-triggered snapshot to
-// complete.
-type userSnapshotFuture struct {
+// snapshotFuture is used for waiting on a snapshot to complete.
+type snapshotFuture struct {
 	deferError
-
-	// opener is a function used to open the snapshot. This is filled in
-	// once the future returns with no error.
-	opener func() (*SnapshotMeta, io.ReadCloser, error)
-}
-
-// Open is a function you can call to access the underlying snapshot and its
-// metadata.
-func (u *userSnapshotFuture) Open() (*SnapshotMeta, io.ReadCloser, error) {
-	if u.opener == nil {
-		return nil, nil, fmt.Errorf("no snapshot available")
-	} else {
-		// Invalidate the opener so it can't get called multiple times,
-		// which isn't generally safe.
-		defer func() {
-			u.opener = nil
-		}()
-		return u.opener()
-	}
-}
-
-// userRestoreFuture is used for waiting on a user-triggered restore of an
-// external snapshot to complete.
-type userRestoreFuture struct {
-	deferError
-
-	// meta is the metadata that belongs with the snapshot.
-	meta *SnapshotMeta
-
-	// reader is the interface to read the snapshot contents from.
-	reader io.Reader
 }
 
 // reqSnapshotFuture is used for requesting a snapshot start.
@@ -205,8 +165,8 @@ type reqSnapshotFuture struct {
 	deferError
 
 	// snapshot details provided by the FSM runner before responding
-	index    uint64
-	term     uint64
+	index    Index
+	term     Term
 	snapshot FSMSnapshot
 }
 
@@ -217,14 +177,10 @@ type restoreFuture struct {
 	ID string
 }
 
-// verifyFuture is used to verify the current node is still
-// the leader. This is to prevent a stale read.
+// verifyFuture is returned by VerifyLeader(), used to check that a majority of
+// the cluster still believes the local server to be the current leader.
 type verifyFuture struct {
 	deferError
-	notifyCh   chan *verifyFuture
-	quorumSize int
-	votes      int
-	voteLock   sync.Mutex
 }
 
 // campaignFuture is used to force the node to forget it's leader
@@ -236,21 +192,21 @@ type campaignFuture struct {
 	runForElection bool
 }
 
-// configurationsFuture is used to retrieve the current configurations. This is
+// membershipsFuture is used to retrieve the current memberships. This is
 // used to allow safe access to this information outside of the main thread.
-type configurationsFuture struct {
+type membershipsFuture struct {
 	deferError
-	configurations configurations
+	memberships memberships
 }
 
-// Configuration returns the latest configuration in use by Raft.
-func (c *configurationsFuture) Configuration() Configuration {
-	return c.configurations.latest
+// Membership returns the latest membership configuration in use by Raft.
+func (f *membershipsFuture) Membership() Membership {
+	return f.memberships.latest
 }
 
-// Index returns the index of the latest configuration in use by Raft.
-func (c *configurationsFuture) Index() uint64 {
-	return c.configurations.latestIndex
+// Index returns the index of the latest membership in use by Raft.
+func (f *membershipsFuture) Index() Index {
+	return f.memberships.latestIndex
 }
 
 // appendFuture is used for waiting on a pipelined append
@@ -272,4 +228,20 @@ func (a *appendFuture) Request() *AppendEntriesRequest {
 
 func (a *appendFuture) Response() *AppendEntriesResponse {
 	return a.resp
+}
+
+type StatsFuture interface {
+	Future
+	// Stats returns variuos bits of internal information. This must
+	// not be called until after the Error method has returned.
+	Stats() *Stats
+}
+
+type statsFuture struct {
+	deferError
+	stats *Stats
+}
+
+func (s *statsFuture) Stats() *Stats {
+	return s.stats
 }

@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	log "github.com/mgutz/logxi/v1"
 )
 
 type TestingPeer struct {
@@ -17,7 +18,7 @@ type TestingPeer struct {
 	peerTrans    *InmemTransport
 	localAddr    ServerAddress
 	localTrans   *InmemTransport
-	logger       *log.Logger
+	logger       log.Logger
 	logs         LogStore
 	snapshots    SnapshotStore
 	snapshotDir  string
@@ -31,7 +32,7 @@ type TestingPeer struct {
 }
 
 var (
-	configuration3 = Configuration{}
+	configuration3 = Membership{}
 	entry14        = Log{
 		Index: 14,
 		Term:  70,
@@ -129,6 +130,7 @@ func makePeerTesting(t *testing.T, tp *TestingPeer) *TestingPeer {
 		tp.goRoutines,
 		tp.localTrans, // give it localTrans so that it can talk to peerTrans
 		tp.localAddr,
+		ProtocolVersionMax,
 		tp.controlCh,
 		tp.progressCh,
 		tp.options)
@@ -265,10 +267,10 @@ func serveReplies(tp *TestingPeer, replies []cannedReply) Future {
 				}
 				errReply, ok := reply.reply.(error)
 				if ok {
-					tp.peer.shared.logger.Printf("Peer Test: Replying to %T with error", rpc.Command)
+					tp.peer.shared.logger.Info(fmt.Sprintf("Replying to %T with error", rpc.Command))
 					rpc.Respond(nil, errReply)
 				} else {
-					tp.peer.shared.logger.Printf("Peer Test: Replying to %T", rpc.Command)
+					tp.peer.shared.logger.Info(fmt.Sprintf("Replying to %T", rpc.Command))
 					rpc.Respond(reply.reply, nil)
 				}
 			case <-time.After(time.Millisecond * 100):
@@ -931,6 +933,39 @@ func TestPeer_AppendEntriesRPC_heartbeat_sendRecvError(t *testing.T) {
 		t.Errorf("nextIndex should be 19, got %v",
 			tp.peer.leader.nextIndex)
 	}
+	if tp.peer.leader.nextCommitIndex > 17 {
+		t.Errorf("nextCommitIndex should be <= 17, got %v",
+			tp.peer.leader.nextCommitIndex)
+	}
+}
+
+// This targets restoring the nextCommitIndex properly.
+// The logic used to be:
+//     if p.leader.nextCommitIndex == rpc.req.LeaderCommitIndex+1 {
+//         p.leader.nextCommitIndex = rpc.req.PrevLogEntry + 1
+//     }
+// which would allow nextCommitIndex to be erroneously increased.
+func TestPeer_AppendEntriesRPC_heartbeat_sendRecvError2(t *testing.T) {
+	tp := makePeerTesting(t, &TestingPeer{
+		initControl:  &appendEntriesControl,
+		initProgress: &appendEntriesProgress,
+	})
+	defer tp.close()
+	tp.peer.progress.matchIndex = 18
+	tp.peer.leader.nextIndex = 19
+	tp.peer.leader.nextCommitIndex = 17
+	err := oneErrRPC(tp, nil, errors.New("a transport error"))
+	if err != nil {
+		t.Error(err)
+	}
+	if tp.peer.leader.nextIndex != 19 {
+		t.Errorf("nextIndex should be 19, got %v",
+			tp.peer.leader.nextIndex)
+	}
+	if tp.peer.leader.nextCommitIndex > 17 {
+		t.Errorf("nextCommitIndex should be <= 17, got %v",
+			tp.peer.leader.nextCommitIndex)
+	}
 }
 
 func TestPeer_AppendEntriesRPC_sendRecvError(t *testing.T) {
@@ -970,7 +1005,7 @@ func TestPeer_InstallSnapshotRPC_success(t *testing.T) {
 	}
 	err := waitFor(tp, func() bool { return tp.peer.leader.needsSnapshot })
 	if err != nil {
-		t.Error("expected AppendEntries RPC to set needsSnapshot: %v", err)
+		t.Errorf("expected AppendEntries RPC to set needsSnapshot: %v", err)
 	}
 
 	exp := InstallSnapshotRequest{
@@ -981,7 +1016,7 @@ func TestPeer_InstallSnapshotRPC_success(t *testing.T) {
 		LastLogIndex:       15,
 		LastLogTerm:        75,
 		Peers:              encodePeers(configuration3, tp.localTrans),
-		Configuration:      encodeConfiguration(configuration3),
+		Configuration:      encodeMembership(configuration3),
 		ConfigurationIndex: 3,
 		Size:               5,
 	}

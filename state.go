@@ -38,56 +38,36 @@ func (s RaftState) String() string {
 	}
 }
 
-// raftState is used to maintain various state variables
+// raftShared is used to maintain various state variables
 // and provides an interface to set/get the variables in a
 // thread safe manner.
-type raftState struct {
-	// The current term, cache of StableStore
-	currentTerm uint64
-
-	// Highest committed log entry
-	commitIndex uint64
-
-	// Last applied log to the FSM
-	lastApplied uint64
-
+type raftShared struct {
 	// protects 4 next fields
 	lastLock sync.Mutex
 
 	// Cache the latest snapshot index/term
-	lastSnapshotIndex uint64
-	lastSnapshotTerm  uint64
+	lastSnapshotIndex Index
+	lastSnapshotTerm  Term
 
 	// Cache the latest log from LogStore
-	lastLogIndex uint64
-	lastLogTerm  uint64
+	lastLogIndex Index
+	lastLogTerm  Term
 
 	// The current state
 	state RaftState
-
-	// Tracks running goroutines
-	goRoutines *waitGroup
 }
 
-func (r *raftState) getState() RaftState {
+func (r *raftShared) getState() RaftState {
 	stateAddr := (*uint32)(&r.state)
 	return RaftState(atomic.LoadUint32(stateAddr))
 }
 
-func (r *raftState) setState(s RaftState) {
+func (r *raftShared) setState(s RaftState) {
 	stateAddr := (*uint32)(&r.state)
 	atomic.StoreUint32(stateAddr, uint32(s))
 }
 
-func (r *raftState) getCurrentTerm() uint64 {
-	return atomic.LoadUint64(&r.currentTerm)
-}
-
-func (r *raftState) setCurrentTerm(term uint64) {
-	atomic.StoreUint64(&r.currentTerm, term)
-}
-
-func (r *raftState) getLastLog() (index, term uint64) {
+func (r *raftShared) getLastLog() (index Index, term Term) {
 	r.lastLock.Lock()
 	index = r.lastLogIndex
 	term = r.lastLogTerm
@@ -95,14 +75,14 @@ func (r *raftState) getLastLog() (index, term uint64) {
 	return
 }
 
-func (r *raftState) setLastLog(index, term uint64) {
+func (r *raftShared) setLastLog(index Index, term Term) {
 	r.lastLock.Lock()
 	r.lastLogIndex = index
 	r.lastLogTerm = term
 	r.lastLock.Unlock()
 }
 
-func (r *raftState) getLastSnapshot() (index, term uint64) {
+func (r *raftShared) getLastSnapshot() (index Index, term Term) {
 	r.lastLock.Lock()
 	index = r.lastSnapshotIndex
 	term = r.lastSnapshotTerm
@@ -110,40 +90,27 @@ func (r *raftState) getLastSnapshot() (index, term uint64) {
 	return
 }
 
-func (r *raftState) setLastSnapshot(index, term uint64) {
+func (r *raftShared) setLastSnapshot(index Index, term Term) {
 	r.lastLock.Lock()
 	r.lastSnapshotIndex = index
 	r.lastSnapshotTerm = term
 	r.lastLock.Unlock()
 }
 
-func (r *raftState) getCommitIndex() uint64 {
-	return atomic.LoadUint64(&r.commitIndex)
-}
-
-func (r *raftState) setCommitIndex(index uint64) {
-	atomic.StoreUint64(&r.commitIndex, index)
-}
-
-func (r *raftState) getLastApplied() uint64 {
-	return atomic.LoadUint64(&r.lastApplied)
-}
-
-func (r *raftState) setLastApplied(index uint64) {
-	atomic.StoreUint64(&r.lastApplied, index)
-}
-
 // getLastIndex returns the last index in stable storage.
 // Either from the last log or from the last snapshot.
-func (r *raftState) getLastIndex() uint64 {
+func (r *raftShared) getLastIndex() Index {
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
-	return max(r.lastLogIndex, r.lastSnapshotIndex)
+	if r.lastLogIndex > r.lastSnapshotIndex {
+		return r.lastLogIndex
+	}
+	return r.lastSnapshotIndex
 }
 
 // getLastEntry returns the last index and term in stable storage.
 // Either from the last log or from the last snapshot.
-func (r *raftState) getLastEntry() (uint64, uint64) {
+func (r *raftShared) getLastEntry() (Index, Term) {
 	r.lastLock.Lock()
 	defer r.lastLock.Unlock()
 	if r.lastLogIndex >= r.lastSnapshotIndex {

@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"testing"
 	"time"
+
+	log "github.com/mgutz/logxi/v1"
 )
 
 // CheckInteg will skip a test if integration testing is not enabled.
@@ -30,11 +31,10 @@ type RaftEnv struct {
 	snapshot *FileSnapshotStore
 	trans    *NetworkTransport
 	raft     *Raft
-	logger   *log.Logger
+	logger   log.Logger
 }
 
 func (r *RaftEnv) Release() {
-	r.logger.Printf("[WARN] Release node at %v", r.raft.localAddr)
 	f := r.raft.Shutdown()
 	if err := f.Error(); err != nil {
 		panic(err)
@@ -67,7 +67,7 @@ func MakeRaft(t *testing.T, conf *Config, bootstrap bool) *RaftEnv {
 		store:    stable,
 		snapshot: snap,
 		fsm:      &MockFSM{},
-		logger:   log.New(&testLoggerAdapter{t: t}, "", log.Lmicroseconds),
+		logger:   newTestLogger(t),
 	}
 
 	trans, err := NewTCPTransport("127.0.0.1:0", nil, 2, time.Second, nil)
@@ -77,19 +77,20 @@ func MakeRaft(t *testing.T, conf *Config, bootstrap bool) *RaftEnv {
 	env.trans = trans
 
 	if bootstrap {
-		var configuration Configuration
-		configuration.Servers = append(configuration.Servers, Server{
-			Suffrage: Voter,
-			ID:       conf.LocalID,
-			Address:  trans.LocalAddr(),
-		})
-		err = BootstrapCluster(conf, stable, stable, snap, trans, configuration)
+		membership := Membership{
+			Servers: []Server{{
+				Suffrage: Voter,
+				ID:       conf.LocalID,
+				Address:  trans.LocalAddr(),
+			}},
+		}
+		err = BootstrapCluster(conf, stable, stable, snap, trans, membership)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
 	}
 
-	log.Printf("[INFO] Starting node at %v", trans.LocalAddr())
+	log.Info("Starting node at %v", trans.LocalAddr())
 	raft, err := NewRaft(conf, env.fsm, stable, stable, snap, trans)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -194,7 +195,6 @@ func TestRaft_Integ(t *testing.T) {
 	}
 	for _, f := range futures {
 		NoErr(WaitFuture(f, t), t)
-		env1.logger.Printf("[DEBUG] Applied %v", f)
 	}
 
 	// Do a snapshot
@@ -221,7 +221,6 @@ func TestRaft_Integ(t *testing.T) {
 	}
 	for _, f := range futures {
 		NoErr(WaitFuture(f, t), t)
-		leader.logger.Printf("[DEBUG] Applied %v", f)
 	}
 
 	// Shoot two nodes in the head!
@@ -242,7 +241,6 @@ func TestRaft_Integ(t *testing.T) {
 	}
 	for _, f := range futures {
 		NoErr(WaitFuture(f, t), t)
-		leader.logger.Printf("[DEBUG] Applied %v", f)
 	}
 
 	// Join a few new nodes!
@@ -255,8 +253,8 @@ func TestRaft_Integ(t *testing.T) {
 	}
 
 	// Remove the old nodes
-	NoErr(WaitFuture(leader.raft.RemoveServer(rm1.raft.localID, 0, 0), t), t)
-	NoErr(WaitFuture(leader.raft.RemoveServer(rm2.raft.localID, 0, 0), t), t)
+	NoErr(WaitFuture(leader.raft.RemoveServer(rm1.raft.server.localID, 0, 0), t), t)
+	NoErr(WaitFuture(leader.raft.RemoveServer(rm2.raft.server.localID, 0, 0), t), t)
 
 	// Shoot the leader
 	env1.Release()

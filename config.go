@@ -3,8 +3,9 @@ package raft
 import (
 	"fmt"
 	"io"
-	"log"
 	"time"
+
+	log "github.com/mgutz/logxi/v1"
 )
 
 // These are the versions of the protocol (which includes RPC messages as
@@ -187,7 +188,7 @@ type Config struct {
 
 	// Logger is a user-provided logger. If nil, a logger writing to LogOutput
 	// is used.
-	Logger *log.Logger
+	Logger log.Logger
 }
 
 // DefaultConfig returns a Config with usable defaults.
