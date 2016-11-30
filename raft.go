@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/armon/go-metrics"
 )
@@ -156,6 +158,9 @@ func (r *raftServer) runFollower() {
 	r.logger.Info("Entering Follower state", "leader", r.getLeader())
 	metrics.IncrCounter([]string{"raft", "state", "follower"}, 1)
 	heartbeatTimer := randomTimeout(r.conf.HeartbeatTimeout)
+
+	var campaign unsafe.Pointer
+
 	for {
 		select {
 		case rpc := <-r.rpcCh:
@@ -180,6 +185,22 @@ func (r *raftServer) runFollower() {
 		case f := <-r.api.statsCh:
 			f.stats = r.stats()
 			f.respond(nil)
+
+		case e := <-r.api.campaignCh:
+			r.setLeader("")
+
+			if e.runForElection {
+				// Wait for the timeout
+				if !atomic.CompareAndSwapPointer(&campaign, unsafe.Pointer(nil), unsafe.Pointer(e)) {
+					e.respond(ErrBadStateForElection)
+					continue
+				}
+
+				// a bit shorter of a timeout this time round
+				heartbeatTimer = randomTimeout(time.Millisecond)
+			} else {
+				e.respond(nil)
+			}
 
 		case b := <-r.api.bootstrapCh:
 			b.respond(r.liveBootstrap(b.membership))
@@ -215,8 +236,17 @@ func (r *raftServer) runFollower() {
 					"last_contact", lastContact)
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				r.setState(Candidate)
+				if campaign != nil {
+					(*campaignFuture)(campaign).respond(nil)
+					campaign = nil
+				}
 				r.updatePeers()
 				return
+			}
+
+			if campaign != nil {
+				(*campaignFuture)(campaign).respond(ErrBadStateForElection)
+				campaign = nil
 			}
 
 		case <-r.api.shutdownCh:
@@ -286,6 +316,9 @@ func (r *raftServer) runCandidate() {
 				peer.progress = progress
 				r.computeCandidateProgress()
 			}
+		case e := <-r.api.campaignCh:
+			// The node is already a candidate
+			e.respond(nil)
 
 		case c := <-r.api.membershipChangeCh:
 			// Reject any operations since we are not the leader

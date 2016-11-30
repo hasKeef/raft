@@ -183,6 +183,15 @@ type verifyFuture struct {
 	deferError
 }
 
+// campaignFuture is used to force the node to forget it's leader
+// and optionally run for election. This is useful in a case where the
+// caller knows for fact that the leader has gone offline and wants to
+// force a re-election in < ElectionTimeout
+type campaignFuture struct {
+	deferError
+	runForElection bool
+}
+
 // membershipsFuture is used to retrieve the current memberships. This is
 // used to allow safe access to this information outside of the main thread.
 type membershipsFuture struct {

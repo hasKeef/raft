@@ -6,8 +6,9 @@ package raftbench
 // makes comparing backend performance easier by sharing the tests.
 
 import (
-	"github.com/hashicorp/raft"
 	"testing"
+
+	"github.com/hashicorp/raft"
 )
 
 func FirstIndex(b *testing.B, store raft.LogStore) {
@@ -31,7 +32,7 @@ func LastIndex(b *testing.B, store raft.LogStore) {
 	// Create some fake data
 	var logs []*raft.Log
 	for i := 1; i < 10; i++ {
-			logs = append(logs, &raft.Log{Index: raft.Index(i), Data: []byte("data")})
+		logs = append(logs, &raft.Log{Index: raft.Index(i), Data: []byte("data")})
 	}
 	if err := store.StoreLogs(logs); err != nil {
 		b.Fatalf("err: %s", err)
