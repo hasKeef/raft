@@ -190,6 +190,7 @@ func (r *raftServer) runFollower() {
 			r.setLeader("")
 
 			if e.runForElection {
+				r.logger.Info("Triggering Forced Early election")
 				// Wait for the timeout
 				if !atomic.CompareAndSwapPointer(&campaign, unsafe.Pointer(nil), unsafe.Pointer(e)) {
 					e.respond(ErrBadStateForElection)
@@ -197,7 +198,8 @@ func (r *raftServer) runFollower() {
 				}
 
 				// a bit shorter of a timeout this time round
-				heartbeatTimer = randomTimeout(time.Millisecond)
+				r.lastContact = time.Now().Add(-r.conf.HeartbeatTimeout - 1)
+				heartbeatTimer = randomTimeout(time.Microsecond)
 			} else {
 				e.respond(nil)
 			}
